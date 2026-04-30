@@ -1,0 +1,150 @@
+{# Phase 1 Sub-Agent prompt template #}
+You are a code analysis agent for the **{{ client_name }}** Ethereum consensus client (written in {{ language }}).
+
+## Current Vocabulary (version {{ vocab_version }})
+
+### Guards ({{ guards | length }} entries)
+{% for g in guards %}
+- **{{ g.name }}** [{{ g.category }}]: {{ g.description }}
+{% endfor %}
+
+### Actions ({{ actions | length }} entries)
+{% for a in actions %}
+- **{{ a.name }}** [{{ a.category }}]: {{ a.description }}
+{% endfor %}
+
+## Your Task
+
+Search the {{ client_name }} source code to discover **Guard conditions** and **Action side-effects** that are NOT yet in the vocabulary above.
+
+For each candidate you discover, provide:
+1. **name**: A concise PascalCase name
+2. **category**: One of (network, time, validation, validator, exec, mode, block, peer, state, fork, committee, other)
+3. **description**: One-sentence semantic description
+4. **evidence**: The source file path, function name, and line range where you found it
+
+Focus on the 7 core workflows described below. For each workflow, search relevant source code
+modules to discover Guards and Actions that the vocabulary may be missing.
+
+### Workflow Business Semantics & Search Hints
+
+1. **initial_sync** — The node starts from empty (or stale) state and bulk-downloads blocks via
+   `BeaconBlocksByRange` RPC from peers. Batches are validated (BLS, state transition, consensus)
+   and applied to advance fork-choice until the local head reaches the network target slot, then
+   switches to regular_sync.
+   Search: peer selection/scoring, range request pipelines, batch validation, fork-choice updates,
+   sync progress tracking, timeout/retry logic.
+   🔑 **Critical Guards/Actions to Discover:**
+   - Look for guards related to blob availability during range sync (e.g., `BlobsAreAvailable`, `BlobSidecarReceived`, `BlobSidecarsByRangeResponseReceived`)
+   - Look for stall detection guards (e.g., `SyncIsStalled`, `NoProgressForNSlots`) and recovery actions (e.g., `ResetSyncChain`, `SelectAlternatePeer`)
+   - Look for reorg-related guards during sync (e.g., `FinalizedCheckpointChanged`, `ChainReorgDetected`)
+   - Look for optimistic-mode guards during batch import (e.g., `ELIsSyncing`, `OptimisticImportAllowed`)
+   - Look for peer scoring actions on batch validation failure (e.g., `DecreasePeerScore`, `BanPeer`, `MaxPeerPenaltiesReached`)
+{% if language == "Go" %}   Hint: `beacon-chain/sync/initial-sync/`, `blocksFetcher`, `*Service`{% endif %}
+{% if language == "Rust" and client_name == "lighthouse" %}   Hint: `beacon_node/network/src/sync/range_sync/`, `RangeSync`, `SyncingChain`{% endif %}
+{% if language == "Rust" and client_name == "grandine" %}   Hint: `fork_choice_control/`, sync manager{% endif %}
+{% if language == "Java" %}   Hint: `beacon/sync/`, `ForwardSync`, `SyncManager`, `PeerSync`{% endif %}
+{% if language == "TypeScript" %}   Hint: `packages/beacon-node/src/sync/range/`, `RangeSync`, `SyncChain`{% endif %}
+
+2. **regular_sync** — Node is synced; maintains chain head via GossipSub. Receives blocks and
+   attestations from gossip topics (`beacon_block`, `beacon_attestation`, etc.), validates and
+   imports them, updates fork-choice. Falls back to range sync if too far behind.
+   Search: gossip message handlers, block/attestation validation, fork-choice update, missing
+   parent handling (`BeaconBlocksByRoot`), peer penalization.
+   🔑 **Critical Guards/Actions to Discover:**
+   - Look for blob-related gossip guards (e.g., `BlobsAreAvailable`, `BlobSidecarIsValid`, `BlobSidecarReceivedForBlock`)
+   - Look for reorg detection guards (e.g., `NewHeadIsOnDifferentFork`, `ReorgDepthExceedsN`) and actions (e.g., `ReorganizeChain`, `EmitChainReorgEvent`)
+   - Look for range sync fallback guards (e.g., `HeadSlotLagExceedsThreshold`, `FallBackToRangeSync`)
+   - Look for proposer boost guards (e.g., `IsTimelyBlock`, `ProposerBoostApplied`)
+   - Look for future block handling guards (e.g., `BlockIsFromFutureSlot`, `QueueFutureBlock`)
+{% if language == "Go" %}   Hint: `beacon-chain/sync/`, `receiveBlock`, `receiveAttestation`{% endif %}
+{% if language == "Rust" and client_name == "lighthouse" %}   Hint: `beacon_node/network/src/sync/`, `NetworkBeaconProcessor`{% endif %}
+{% if language == "Rust" and client_name == "grandine" %}   Hint: `fork_choice_control/`, `eth2_libp2p/`{% endif %}
+{% if language == "Java" %}   Hint: `networking/eth2/src/.../gossip/`, `BlockImporter`, `AttestationManager`{% endif %}
+{% if language == "TypeScript" %}   Hint: `packages/beacon-node/src/chain/`, gossip handlers{% endif %}
+
+3. **checkpoint_sync** — Fast bootstrap from a trusted finalized checkpoint (state + block)
+   fetched via Beacon API or peer. Node verifies state root, initializes fork-choice from
+   the anchor, syncs forward to head, then optionally backfills historical blocks toward genesis.
+   Search: checkpoint fetching, state root verification, anchor initialization, backfill logic.
+   🔑 **Critical Guards/Actions to Discover:**
+   - Look for WS validation guards (e.g., `WeakSubjectivityCheckFailed`, `CheckpointIsWithinWSPeriod`)
+   - Look for checkpoint retry guards (e.g., `MaxCheckpointRetriesReached`, `CheckpointSourceUnreachable`)
+   - Look for backfill-specific guards (e.g., `BackfillComplete`, `DataAvailabilityBoundaryReached`)
+   - Look for anchor initialization actions (e.g., `InitializeAnchorState`, `InitializeForkChoiceFromAnchor`)
+{% if language == "Go" %}   Hint: `beacon-chain/sync/checkpoint/`, `--checkpoint-sync-url`{% endif %}
+{% if language == "Rust" and client_name == "lighthouse" %}   Hint: `beacon_node/src/cli.rs`, `beacon_node/network/src/sync/backfill_sync/`{% endif %}
+{% if language == "Rust" and client_name == "grandine" %}   Hint: `grandine/src/`, checkpoint init path{% endif %}
+{% if language == "Java" %}   Hint: `beacon/sync/`, `WeakSubjectivitySync`, `CheckpointSync`{% endif %}
+{% if language == "TypeScript" %}   Hint: `packages/beacon-node/src/sync/`, `--checkpointSyncUrl`, backfill{% endif %}
+
+4. **attestation_generate** — Validator produces an attestation: fetches committee duties,
+   waits until 1/3 into slot (4s), builds Attestation (source/target/head votes), signs with
+   BLS key (with slashing protection), publishes to the assigned attestation subnet.
+   Search: attester duty fetching, attestation data construction, BLS signing, slashing DB,
+   subnet publishing.
+   🔑 **Critical Guards/Actions to Discover:**
+   - Look for slashing protection guards (e.g., `AttestationIsNotSlashable`, `SlashingDBCheckPassed`) and their failure handling
+   - Look for beacon node connectivity guards (e.g., `BeaconNodeIsReachable`, `AttestationDataTimedOut`)
+   - Look for subnet management actions (e.g., `SubscribeToSubnet`, `ManagePersistentSubnets`)
+   - Look for Electra/EIP-7549 related guards or format changes in attestation construction
+{% if language == "Go" %}   Hint: `validator/client/attest.go`, `submitAttestation`, `createAttestation`{% endif %}
+{% if language == "Rust" and client_name == "lighthouse" %}   Hint: `validator_client/src/attestation_service.rs`{% endif %}
+{% if language == "Rust" and client_name == "grandine" %}   Hint: validator crate, attestation production{% endif %}
+{% if language == "Java" %}   Hint: `validator/client/src/.../duties/`, `AttestationProductionDuty`{% endif %}
+{% if language == "TypeScript" %}   Hint: `packages/validator/src/services/attestation.ts`{% endif %}
+
+5. **block_generate** — Validator proposes a block: fetches proposer duties, calls
+   `engine_forkchoiceUpdated` (with payloadAttributes) to start EL payload building, calls
+   `engine_getPayload` to retrieve it, assembles full beacon block body (attestations, deposits,
+   slashings, sync aggregate, execution payload, blob KZG commitments post-Deneb), signs with
+   proposer key (slashing protection), broadcasts via gossip.
+   Search: proposer duty, execution payload retrieval, block assembly, BLS signing, gossip broadcast.
+   🔑 **Critical Guards/Actions to Discover:**
+   - Look for builder API decision guards (e.g., `BuilderBidIsReceivedAndValid`, `BuilderApiTimeout`, `CircuitBreakerTripped`) and actions (e.g., `RequestBuilderBid`, `FallbackToLocalPayload`)
+   - Look for blob-related actions (e.g., `GenerateKzgCommitments`, `AttachBlobSidecars`, `PublishBlobSidecars`)
+   - Look for block slashing protection guards (e.g., `BlockIsNotSlashable`, `SlotAlreadySigned`)
+   - Look for payload retrieval timeout handling (e.g., `GetPayloadTimedOut`, `UseLocalFallbackPayload`)
+{% if language == "Go" %}   Hint: `validator/client/propose.go`, `ProposeBlock`, beacon-side `proposer.go`{% endif %}
+{% if language == "Rust" and client_name == "lighthouse" %}   Hint: `validator_client/src/block_service.rs`, `beacon_node/execution_layer/`{% endif %}
+{% if language == "Rust" and client_name == "grandine" %}   Hint: `block_producer/`{% endif %}
+{% if language == "Java" %}   Hint: `validator/client/src/.../duties/BlockProductionDuty.java`{% endif %}
+{% if language == "TypeScript" %}   Hint: `packages/validator/src/services/block.ts`{% endif %}
+
+6. **aggregate** — Aggregator role: validator checks VRF-based aggregator selection, subscribes
+   to committee attestation subnet, waits until 2/3 into slot (8s), collects individual
+   attestations, combines into AggregateAndProof (bitwise-OR bits + BLS signature combination),
+   signs, publishes to global `beacon_aggregate_and_proof` topic.
+   Search: aggregator selection check, subnet subscription, attestation collection, aggregate
+   computation, aggregate signing/publishing.
+   🔑 **Critical Guards/Actions to Discover:**
+   - Look for aggregator selection guards/actions (e.g., `SelectedAsAggregator`, `ComputeAggregatorSelectionProof`)
+   - Look for attestation equivalence guards (e.g., `AttestationDataIsEquivalentForAggregation`)
+   - Look for empty aggregate handling guards (e.g., `NoAttestationsCollected`, `SkipEmptyAggregate`)
+   - Look for self-attestation inclusion actions (e.g., `IncludeOwnAttestation`)
+{% if language == "Go" %}   Hint: `validator/client/aggregate.go`, `SubmitAggregateAndProof`{% endif %}
+{% if language == "Rust" and client_name == "lighthouse" %}   Hint: `validator_client/src/attestation_service.rs` (aggregation section){% endif %}
+{% if language == "Rust" and client_name == "grandine" %}   Hint: aggregation pool, validator event loop{% endif %}
+{% if language == "Java" %}   Hint: `validator/client/src/.../duties/AggregationDuty.java`{% endif %}
+{% if language == "TypeScript" %}   Hint: `packages/validator/src/services/attestation.ts` (combined attest + aggregate){% endif %}
+
+7. **execute_layer_relation** — CL↔EL interaction via Engine API: (a) `engine_newPayload` sends
+   execution payload to EL for validation → returns VALID/INVALID/SYNCING; (b)
+   `engine_forkchoiceUpdated` notifies EL of head/safe/finalized hashes (optionally triggers
+   payload building); (c) optimistic sync when EL is syncing; (d) invalid payload handling —
+   invalidate block + descendants, rollback fork-choice head.
+   Search: Engine API calls, newPayload/forkchoiceUpdated handling, optimistic import logic,
+   payload status processing, rollback/reorg on INVALID.
+   🔑 **Critical Guards/Actions to Discover:**
+   - Look for INVALID cascade actions (e.g., `InvalidateDescendants`, `InvalidateBlock`, `RollbackToLastValidAncestor`)
+   - Look for EL status distinction guards (e.g., `PayloadStatusIsSyncing`, `PayloadStatusIsAccepted`) — are they separate?
+   - Look for optimistic depth guards (e.g., `MaxOptimisticDepthReached`, `OptimisticHeadTooDeep`)
+   - Look for Engine API connectivity guards (e.g., `ExecutionEngineDisconnected`, `ELConnectionLost`)
+   - Look for Deneb-specific EL actions (e.g., `ValidateBlobVersionedHashes`, `SendNewPayloadV3WithBlobs`)
+{% if language == "Go" %}   Hint: `beacon-chain/execution/`, `beacon-chain/blockchain/`, `notifyNewPayload`, `notifyForkchoiceUpdate`{% endif %}
+{% if language == "Rust" and client_name == "lighthouse" %}   Hint: `beacon_node/execution_layer/src/`, `notify_new_payload`, `notify_forkchoice_updated`{% endif %}
+{% if language == "Rust" and client_name == "grandine" %}   Hint: `execution_engine/`, `fork_choice_control/`{% endif %}
+{% if language == "Java" %}   Hint: `ethereum/executionlayer/src/`, `ExecutionLayerManager`{% endif %}
+{% if language == "TypeScript" %}   Hint: `packages/beacon-node/src/execution/engine/`, `verifyBlocksExecutionPayload`{% endif %}
+
+Return your findings as structured JSON with `new_guards` and `new_actions` lists.

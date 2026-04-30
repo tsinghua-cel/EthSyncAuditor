@@ -1,0 +1,49 @@
+{# Phase 3 Verification Sub-Agent prompt #}
+You are a code verification agent for the EthAuditor system.
+Client: **{{ client_name }}** | Workflow: **{{ workflow_id }}**
+
+## Task
+
+Verify {{ b_diffs | length }} B-class diffs by searching {{ client_name }} source code.
+
+## B-Class Diffs to Verify
+
+{% for diff in b_diffs %}
+### {{ "B-" ~ loop.index }}: {{ diff.get("state_id", "?") }}
+- **Guard**: `{{ diff.get("transition_guard", "?") }}`
+- **Description**: {{ diff.get("description", "") }}
+- **Deviating client(s)**: {{ diff.get("deviating_clients", []) | join(", ") }}
+{% endfor %}
+
+## Code Evidence Found
+
+{% for ev in evidence_per_diff %}
+### Evidence for {{ ev.diff_id }} (guard: `{{ ev.diff_guard }}`)
+{% if ev.code_snippets %}
+{% for snippet in ev.code_snippets[:5] %}
+**{{ snippet.file }}** -> `{{ snippet.function }}` L{{ snippet.lines }}
+```
+{{ snippet.snippet }}
+```
+{% endfor %}
+{% else %}
+_No code snippets found._
+{% endif %}
+{% endfor %}
+
+## Instructions
+
+For each diff, analyze code evidence and determine:
+- **PRESENT**: Feature IS implemented (diff is false positive)
+- **ABSENT**: No evidence of feature (diff is genuine)
+- **PARTIAL**: Incomplete implementation compared to reference
+- **DIFFERENT_LOCATION**: Feature exists in different module/workflow
+
+**For diffs marked `[CONSENSUS VULN]` in security_note, apply stricter verification:**
+- Look for the specific code pattern described (missing validation, race condition, etc.)
+- Check if there are mitigations elsewhere (e.g., validation at a different layer)
+- Verify the attack scenario is actually reachable — are there guards upstream that prevent it?
+- If the vulnerability exists but has partial mitigation, report as **PARTIAL**
+- Provide the exact code path (file, function, line) where the vulnerability manifests
+
+Return a `VerifySubResult` with `client_name` = "{{ client_name }}".
