@@ -20,6 +20,11 @@ class Evidence(BaseModel):
     file: str
     function: str
     lines: list[int] = Field(default_factory=list)
+    # ── Audit-review remediation: provenance & validity metadata ─────────
+    is_production: bool = True
+    line_verified: bool = False
+    test_reason: str = ""
+    excerpt: str = ""
 
 
 class Transition(BaseModel):
@@ -65,6 +70,17 @@ class DiffItem(BaseModel):
     deviating_clients: list[str] = Field(default_factory=list)
     security_note: str = ""
     evidence: dict[str, Evidence | None] = Field(default_factory=dict)
+    # ── Audit-review remediation ────────────────────────────────────────
+    # Structured exploit chain. Each entry: {"actor": "...", "trigger": "...",
+    # "path": ["funcA", "funcB"], "impact": "..."}.
+    exploit_chain: list[dict] = Field(default_factory=list)
+    # Output classification after the evidence gate.
+    #   confirmed — production code + verified line + non-empty exploit chain
+    #   lead      — partial evidence, worth investigating
+    #   dropped   — non-production / unverifiable / hallucinated
+    verdict_class: str = ""
+    evidence_quality: str = ""  # STRONG | WEAK | INVALID
+    downgrade_reason: str = ""
 
 
 class DiffReport(BaseModel):
@@ -194,4 +210,10 @@ class GlobalState(TypedDict, total=False):
     rejected_b_diffs: Annotated[list[dict], _merge_lists]
     reclassified_to_a: Annotated[list[dict], _merge_lists]
     verification_evidence: Annotated[dict[str, list], _merge_dicts]
+    # ── Audit-review remediation ─────────────────────────────────────────
+    # Findings dropped by the deterministic evidence gate (non-production
+    # paths, line-range invalid, missing exploit chain on CRITICAL claims).
+    dropped_b_diffs: Annotated[list[dict], _merge_lists]
+    # Per-finding evidence-validation log (one record per finding × client).
+    evidence_audit: Annotated[list[dict], _merge_lists]
 

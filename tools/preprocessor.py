@@ -50,6 +50,12 @@ class SymbolInfo:
     source_code: str = ""
     calls: list[str] = field(default_factory=list)
     called_by: list[str] = field(default_factory=list)
+    # ── Production / test provenance (audit-review remediation) ───────────
+    # ``is_production`` = False ⇒ symbol is in a test / mock / fixture /
+    # bench / example / generator path or inside ``#[cfg(test)] mod tests``
+    # (Rust). ``test_reason`` carries the rule that fired.
+    is_production: bool = True
+    test_reason: str = ""
 
 
 @dataclass
@@ -185,9 +191,15 @@ def _extract_calls(node, call_types: list[str], depth: int = 0) -> list[str]:
 
 
 def _walk_functions(node, func_types: list[str], name_field: str, call_types: list[str],
-                    source_bytes: bytes, file_path: str) -> list[SymbolInfo]:
+                    source_bytes: bytes, file_path: str,
+                    *, language: str = "",
+                    file_is_test: bool = False, file_test_reason: str = "",
+                    cfg_test_ranges: list[tuple[int, int]] | None = None,
+                    ) -> list[SymbolInfo]:
     """Recursively extract functions from the AST."""
     results: list[SymbolInfo] = []
+    cfg_test_ranges = cfg_test_ranges or []
+
     if node.type in func_types:
         fn_name = _find_name_node(node, name_field) or "<anonymous>"
         start = node.start_point[0] + 1  # 1-based
@@ -203,6 +215,22 @@ def _walk_functions(node, func_types: list[str], name_field: str, call_types: li
                 receiver_text = receiver.text.decode("utf-8", errors="replace")
                 qualified = f"({receiver_text}).{fn_name}"
 
+        # ── Production vs test classification ────────────────────────────
+        is_prod = not file_is_test
+        test_reason = file_test_reason
+        if is_prod:
+            in_prod, fn_test_reason = _classify_function_provenance(
+                fn_name=fn_name,
+                body=body,
+                start_line=start,
+                end_line=end,
+                language=language,
+                cfg_test_ranges=cfg_test_ranges,
+            )
+            is_prod = in_prod
+            if not in_prod:
+                test_reason = fn_test_reason
+
         results.append(SymbolInfo(
             file=file_path,
             function_name=fn_name,
@@ -211,10 +239,100 @@ def _walk_functions(node, func_types: list[str], name_field: str, call_types: li
             end_line=end,
             source_code=body,
             calls=list(set(calls)),
+            is_production=is_prod,
+            test_reason=test_reason,
         ))
     for child in node.children:
-        results.extend(_walk_functions(child, func_types, name_field, call_types, source_bytes, file_path))
+        results.extend(_walk_functions(
+            child, func_types, name_field, call_types, source_bytes, file_path,
+            language=language,
+            file_is_test=file_is_test,
+            file_test_reason=file_test_reason,
+            cfg_test_ranges=cfg_test_ranges,
+        ))
     return results
+
+
+# ── Production / test provenance helpers ─────────────────────────────────
+
+# Function-name prefixes that signal test / bench / mock implementations.
+_TEST_FN_PREFIXES = ("test", "fuzz", "bench", "mock", "fake", "stub", "dummy")
+
+
+def _classify_function_provenance(
+    *, fn_name: str, body: str, start_line: int, end_line: int,
+    language: str, cfg_test_ranges: list[tuple[int, int]],
+) -> tuple[bool, str]:
+    """Return (is_production, reason) for a function whose file is production."""
+    fn_lower = fn_name.lower().replace("_", "")
+
+    # Rust: function falls inside a #[cfg(test)] mod block.
+    if language == "rust":
+        for lo, hi in cfg_test_ranges:
+            if start_line >= lo and end_line <= hi:
+                return False, f"inside #[cfg(test)] block L{lo}-L{hi}"
+        head = body.lstrip().splitlines()[:4] if body else []
+        for ln in head:
+            s = ln.strip()
+            if s.startswith("#[test]") or s.startswith("#[tokio::test"):
+                return False, "Rust #[test] attribute"
+            if s.startswith("#[cfg(test)]"):
+                return False, "Rust #[cfg(test)] attribute"
+
+    # Go: TestXxx / BenchmarkXxx / FuzzXxx / ExampleXxx.
+    if language == "go":
+        if any(fn_lower.startswith(p) for p in _TEST_FN_PREFIXES):
+            return False, f"Go test/bench-style function name '{fn_name}'"
+
+    # Java: JUnit @Test annotation immediately preceding the method body.
+    if language == "java":
+        head = body.lstrip().splitlines()[:3] if body else []
+        for ln in head:
+            s = ln.strip()
+            if s.startswith("@Test") or s.startswith("@ParameterizedTest") \
+                    or s.startswith("@RepeatedTest") or s.startswith("@TestFactory"):
+                return False, "Java JUnit @Test annotation"
+
+    return True, ""
+
+
+# Path-level test-file detection (mirrors tools/source_reader rules but kept
+# local to avoid importing source_reader during preprocessing).
+_PATH_TEST_DIR_MARKERS = (
+    "/tests/", "/test/", "/__tests__/", "/spec/", "/specs/",
+    "/fixtures/", "/fixture/", "/mocks/", "/mock/", "/testing/",
+    "/testdata/", "/test_data/", "/test-utils/", "/testutil/",
+    "/test_helpers/", "/benches/", "/bench/", "/examples/",
+)
+_PATH_LANG_MARKERS: dict[str, tuple[str, ...]] = {
+    "rust":       ("/src/bin/test_generator", "/test_generator/"),
+    "go":         ("/testutil/", "/mock/", "/mocks/"),
+    "java":       ("/src/test/", "/integration-test/"),
+    "typescript": ("/__tests__/", "/test/"),
+}
+_FILENAME_TEST_SUFFIXES = (
+    "_test.go", "_tests.rs",
+    ".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx",
+    ".test.js", ".spec.js",
+    "Test.java", "IT.java", "Tests.java",
+)
+
+
+def _classify_path(rel_path: str, language: str) -> tuple[bool, str]:
+    """Return (is_test, reason) using path-only heuristics."""
+    lower = rel_path.lower().replace("\\", "/")
+    for m in _PATH_TEST_DIR_MARKERS:
+        if m in lower:
+            return True, f"path contains '{m.strip('/')}'"
+    for m in _PATH_LANG_MARKERS.get(language, ()):
+        if m in lower:
+            return True, f"path contains '{m.strip('/')}' ({language})"
+    for suf in _FILENAME_TEST_SUFFIXES:
+        if rel_path.endswith(suf):
+            return True, f"filename ends with '{suf}'"
+    if "test_generator" in lower:
+        return True, "path contains 'test_generator'"
+    return False, ""
 
 
 def _extract_symbols(client_name: str) -> list[SymbolInfo]:
@@ -244,6 +362,15 @@ def _extract_symbols(client_name: str) -> list[SymbolInfo]:
             try:
                 source = full_path.read_bytes()
                 tree = parser.parse(source)
+                file_is_test, file_test_reason = _classify_path(rel_path, lang_key)
+                cfg_test_ranges: list[tuple[int, int]] = []
+                if lang_key == "rust" and not file_is_test:
+                    try:
+                        cfg_test_ranges = _scan_rust_cfg_test_ranges(
+                            source.decode("utf-8", errors="replace")
+                        )
+                    except Exception:  # pragma: no cover — defensive
+                        cfg_test_ranges = []
                 file_symbols = _walk_functions(
                     tree.root_node,
                     ast_cfg["func_types"],
@@ -251,13 +378,65 @@ def _extract_symbols(client_name: str) -> list[SymbolInfo]:
                     ast_cfg["call_types"],
                     source,
                     rel_path,
+                    language=lang_key,
+                    file_is_test=file_is_test,
+                    file_test_reason=file_test_reason,
+                    cfg_test_ranges=cfg_test_ranges,
                 )
                 symbols.extend(file_symbols)
             except Exception:
                 logger.debug("Failed to parse %s", full_path, exc_info=True)
 
-    logger.info("[_extract_symbols] client=%s symbols=%d", client_name, len(symbols))
+    n_prod = sum(1 for s in symbols if s.is_production)
+    logger.info(
+        "[_extract_symbols] client=%s symbols=%d production=%d test=%d",
+        client_name, len(symbols), n_prod, len(symbols) - n_prod,
+    )
     return symbols
+
+
+# ── Rust cfg(test) range scanner (pure regex, no tree-sitter) ────────────
+
+_RE_CFG_TEST = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+
+
+def _scan_rust_cfg_test_ranges(text: str) -> list[tuple[int, int]]:
+    """Return inclusive 1-based line ranges of ``#[cfg(test)] mod tests {...}``."""
+    lines = text.splitlines()
+    ranges: list[tuple[int, int]] = []
+    pending = False
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if _RE_CFG_TEST.search(s):
+            pending = True
+            i += 1
+            continue
+        if pending and ("mod " in s or s.startswith("fn ") or "fn " in s):
+            depth = 0
+            opened = False
+            start = i + 1
+            j = i
+            done = False
+            while j < len(lines) and not done:
+                for ch in lines[j]:
+                    if ch == "{":
+                        depth += 1
+                        opened = True
+                    elif ch == "}":
+                        depth -= 1
+                        if opened and depth == 0:
+                            ranges.append((start, j + 1))
+                            done = True
+                            break
+                j += 1
+            pending = False
+            i = max(j, i + 1)
+            continue
+        if pending and s and not s.startswith(("//", "#[")):
+            pending = False
+        i += 1
+    return ranges
 
 
 # Task B — Call-graph construction
@@ -287,18 +466,6 @@ def _build_callgraph(client_name: str, symbols: list[SymbolInfo]) -> CallGraph:
     overrides = ENTRY_POINT_OVERRIDES.get(client_name, {})
     entry_points: dict[str, list[str]] = {}
 
-    # Prefixes/substrings that indicate test/bench/mock functions — not real entry points
-    _SKIP_PREFIXES = ("test", "fuzz", "mock", "bench", "fake", "stub", "dummy")
-    # File path patterns that indicate test files
-    _TEST_PATH_MARKERS = ("/test", "/tests", "/testing", "_test.", "_test_", "test_", "/spec/")
-
-    def _is_test_symbol(sym: SymbolInfo) -> bool:
-        fn_lower = sym.function_name.lower().replace("_", "")
-        if any(fn_lower.startswith(p) for p in _SKIP_PREFIXES):
-            return True
-        file_lower = sym.file.lower()
-        return any(marker in file_lower for marker in _TEST_PATH_MARKERS)
-
     for wf_id in WORKFLOW_IDS:
         if wf_id in overrides:
             entry_points[wf_id] = overrides[wf_id]
@@ -307,7 +474,8 @@ def _build_callgraph(client_name: str, symbols: list[SymbolInfo]) -> CallGraph:
         keywords = ENTRY_POINT_KEYWORDS.get(wf_id, [])
         matched: list[str] = []
         for sym in symbols:
-            if _is_test_symbol(sym):
+            # Skip non-production symbols entirely — entry points must be real.
+            if not sym.is_production:
                 continue
             fn_lower = sym.function_name.lower().replace("_", "")
             if any(kw in fn_lower for kw in keywords):
@@ -429,6 +597,9 @@ def _build_vector_index(client_name: str, symbols: list[SymbolInfo], callgraph: 
                 "workflow_hints": ",".join(wf_hints),
                 "callers": ",".join(callee_to_callers.get(sym.qualified_name, [])[:10]),
                 "callees": ",".join(caller_to_callees.get(sym.qualified_name, [])[:10]),
+                # ── Production / test provenance (audit-review remediation) ──
+                "is_production": bool(sym.is_production),
+                "test_reason":   sym.test_reason or "",
             }
             documents.append(chunk)
             metadatas.append(meta)
@@ -486,6 +657,8 @@ def _build_bm25_index(client_name: str, symbols: list[SymbolInfo]) -> None:
             "start_line": sym.start_line,
             "end_line": sym.end_line,
             "source_code": sym.source_code,
+            "is_production": bool(sym.is_production),
+            "test_reason":   sym.test_reason or "",
         })
 
     if not corpus:

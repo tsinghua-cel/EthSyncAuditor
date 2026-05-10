@@ -49,9 +49,13 @@ class CodeEvidence(BaseModel):
 class VerifySubFinding(BaseModel):
     """One sub-agent's finding about a single B-class diff."""
     diff_id: str = ""
-    finding: str = "ABSENT"  # PRESENT | ABSENT | PARTIAL | DIFFERENT_LOCATION
+    finding: str = "ABSENT"  # PRESENT | ABSENT | PARTIAL | DIFFERENT_LOCATION | EVIDENCE_INVALID
     code_evidence: list[CodeEvidence] = Field(default_factory=list)
     explanation: str = ""
+    # ── Audit-review remediation ────────────────────────────────────────
+    evidence_quality: str = "STRONG"     # STRONG | WEAK | INVALID
+    production_path: str | None = None
+    line_range_verified: bool = True
 
 
 class VerifySubResult(BaseModel):
@@ -63,13 +67,18 @@ class VerifySubResult(BaseModel):
 class VerifyVerdict(BaseModel):
     """Verdict for a single B-class diff."""
     diff_id: str = ""
-    verdict: str = "CONFIRMED"  # CONFIRMED | REJECTED | DOWNGRADED | RECLASSIFIED
+    verdict: str = "CONFIRMED"  # CONFIRMED | REJECTED | DOWNGRADED | RECLASSIFIED | DROPPED
     original_severity: str = ""
     new_severity: str = ""
     confidence: float = 0.8
     evidence_summary: str = ""
     updated_description: str = ""
     updated_security_note: str = ""
+    # ── Audit-review remediation ────────────────────────────────────────
+    is_production: bool = True
+    line_verified: bool = True
+    exploit_chain_present: bool = False
+    downgrade_reason: str = ""
 
 
 class VerifyMainResult(BaseModel):
@@ -199,6 +208,8 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
 
         # ── Code search phase ──────────────────────────────────────────
         all_evidence: list[dict] = []
+        prefilter_findings: dict[str, dict] = {}
+        evidence_audit_records: list[dict] = []
 
         try:
             from tools.search import search_codebase_by_workflow
@@ -206,20 +217,56 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
         except ImportError:
             search_available = False
 
+        # Lazy import — kept inside _run to avoid hard dep at module load.
+        from tools.evidence_validator import (
+            DROP, validate_evidence,
+        )
+        from tools.source_reader import read_source_lines
+
         is_mock = llm is None
         for i, diff in enumerate(b_diffs):
             diff_id = f"B-{i + 1}"
-            queries = _build_search_queries(diff)
+
+            # ── (1) Hard pre-filter on the LLM-supplied evidence ────────
+            llm_evidence = (diff.get("evidence") or {}).get(client_name)
+            if hasattr(llm_evidence, "model_dump"):
+                llm_evidence = llm_evidence.model_dump()
+            ev_verdict = validate_evidence(llm_evidence, client_name)
+            evidence_audit_records.append({
+                "workflow_id": current_wf,
+                "diff_id": diff_id,
+                "client": client_name,
+                "stage": "phase3_sub_prefilter",
+                **ev_verdict.to_dict(),
+            })
+
+            # ── (2) Build prompt-side snippets: prefer the cited code,
+            #        fall back to call-graph search (production-only). ──
             code_snippets: list[dict] = []
+            if ev_verdict.action != DROP and ev_verdict.excerpt:
+                code_snippets.append({
+                    "file": llm_evidence.get("file", "") if llm_evidence else "",
+                    "function": llm_evidence.get("function", "") if llm_evidence else "",
+                    "lines": [ev_verdict.total_lines and 0, ev_verdict.total_lines and 0],
+                    "snippet": ev_verdict.excerpt[:1500],
+                    "query": "<cited-evidence>",
+                    "score": 1.0,
+                    "is_production": ev_verdict.is_production,
+                    "test_reason": ev_verdict.test_reason,
+                })
 
             if search_available and not is_mock:
+                queries = _build_search_queries(diff)
                 for query in queries:
                     try:
+                        # Production-only by default — filters Rust cfg(test),
+                        # *_test.go, *.test.ts, /tests/, mocks, etc.
                         results = search_codebase_by_workflow(
                             workflow_id=current_wf,
                             query=query,
                             client_name=client_name,
                             top_k=VERIFY_SEARCH_TOP_K,
+                            production_only=True,
                         )
                         for r in results:
                             code_snippets.append({
@@ -232,6 +279,8 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
                                 "snippet": r.content[:500] if r.content else "",
                                 "query": query,
                                 "score": r.score,
+                                "is_production": r.metadata.get("is_production", True),
+                                "test_reason": r.metadata.get("test_reason", ""),
                             })
                     except Exception:
                         logger.debug(
@@ -246,6 +295,24 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
                 "client": client_name,
                 "code_snippets": code_snippets,
             })
+
+            # ── (3) If pre-filter said DROP and we ALSO got no production
+            #        snippets from search, short-circuit the LLM call. ──
+            has_prod_snippet = any(s.get("is_production", True)
+                                   for s in code_snippets)
+            if ev_verdict.action == DROP and not has_prod_snippet:
+                prefilter_findings[diff_id] = {
+                    "diff_id": diff_id,
+                    "finding": "EVIDENCE_INVALID",
+                    "code_evidence": [],
+                    "explanation": (
+                        f"Pre-filter dropped: {ev_verdict.downgrade_reason}. "
+                        f"No production-code snippets found by directed search."
+                    ),
+                    "evidence_quality": "INVALID",
+                    "production_path": None,
+                    "line_range_verified": ev_verdict.line_verified,
+                }
 
         # ── LLM analysis (if available) ────────────────────────────────
         if llm is not None:
@@ -264,7 +331,23 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
                     callbacks=callbacks,
                 )
                 findings = [f.model_dump() for f in result.findings]
-                return {"verification_evidence": {client_name: findings}}
+                # Pre-filter wins over LLM for deterministic INVALID cases.
+                merged: list[dict] = []
+                seen: set[str] = set()
+                for f in findings:
+                    fid = f.get("diff_id", "")
+                    if fid in prefilter_findings:
+                        merged.append(prefilter_findings[fid])
+                    else:
+                        merged.append(f)
+                    seen.add(fid)
+                for fid, pf in prefilter_findings.items():
+                    if fid not in seen:
+                        merged.append(pf)
+                return {
+                    "verification_evidence": {client_name: merged},
+                    "evidence_audit": evidence_audit_records,
+                }
             except Exception:
                 logger.error(
                     "LLM call failed for phase3_verify_sub/%s/%s",
@@ -274,20 +357,34 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
         # ── Mock fallback: return raw search evidence ──────────────────
         mock_findings: list[dict] = []
         for ev in all_evidence:
-            has_code = len(ev.get("code_snippets", [])) > 0
+            fid = ev["diff_id"]
+            if fid in prefilter_findings:
+                mock_findings.append(prefilter_findings[fid])
+                continue
+            prod_snippets = [s for s in ev.get("code_snippets", [])
+                             if s.get("is_production", True)]
+            has_code = len(prod_snippets) > 0
             mock_findings.append({
-                "diff_id": ev["diff_id"],
+                "diff_id": fid,
                 "finding": "PRESENT" if has_code else "ABSENT",
-                "code_evidence": ev.get("code_snippets", [])[:3],
+                "code_evidence": prod_snippets[:3],
                 "explanation": (
-                    f"Found {len(ev.get('code_snippets', []))} code snippets "
+                    f"Found {len(prod_snippets)} production snippets "
                     f"for guard '{ev['diff_guard']}' in {client_name}"
                     if has_code else
-                    f"No code evidence found for guard '{ev['diff_guard']}' "
-                    f"in {client_name}"
+                    f"No production code evidence for guard "
+                    f"'{ev['diff_guard']}' in {client_name}"
                 ),
+                "evidence_quality": "STRONG" if has_code else "INVALID",
+                "production_path": (
+                    prod_snippets[0]["file"] if prod_snippets else None
+                ),
+                "line_range_verified": has_code,
             })
-        return {"verification_evidence": {client_name: mock_findings}}
+        return {
+            "verification_evidence": {client_name: mock_findings},
+            "evidence_audit": evidence_audit_records,
+        }
 
     return _run
 
@@ -357,19 +454,19 @@ def _deterministic_verify(
     """Heuristic verification when no LLM is available.
 
     Rules:
-    1. If ALL deviating clients have PRESENT finding → REJECTED
-       (the feature exists, just named/located differently).
-    2. If some deviating clients have DIFFERENT_LOCATION and none ABSENT
-       → RECLASSIFIED (naming/structural difference, not logic).
-    3. If some deviating clients have PARTIAL and none ABSENT
-       → DOWNGRADED (partially implemented → lower severity).
-    4. Otherwise (ABSENT in ≥1 deviating client) → CONFIRMED.
+    1. If ANY deviating client has EVIDENCE_INVALID → DROPPED.
+    2. If ALL deviating clients have PRESENT finding → REJECTED.
+    3. If some deviating clients have DIFFERENT_LOCATION and none ABSENT
+       → RECLASSIFIED.
+    4. If some deviating clients have PARTIAL and none ABSENT
+       → DOWNGRADED.
+    5. Otherwise → CONFIRMED.
     """
     verified: list[dict] = []
     rejected: list[dict] = []
     reclassified: list[dict] = []
+    dropped: list[dict] = []
 
-    # Index findings by (client, diff_id)
     findings_idx: dict[tuple[str, str], dict] = {}
     for client, findings in evidence_map.items():
         if not isinstance(findings, list):
@@ -383,24 +480,37 @@ def _deterministic_verify(
         severity = diff.get("severity", "MAJOR")
 
         if not deviating:
-            verified.append({**diff, "verification_status": "CONFIRMED"})
+            verified.append({**diff, "verification_status": "CONFIRMED",
+                             "verdict_class": "confirmed"})
             continue
 
-        # Gather findings for each deviating client
         dev_findings: list[str] = []
         for client in deviating:
             f = findings_idx.get((client, diff_id), {})
             dev_findings.append(f.get("finding", "ABSENT"))
 
-        present_count = sum(1 for f in dev_findings if f == "PRESENT")
-        partial_count = sum(1 for f in dev_findings if f == "PARTIAL")
-        diff_loc_count = sum(1 for f in dev_findings if f == "DIFFERENT_LOCATION")
-        absent_count = sum(1 for f in dev_findings if f == "ABSENT")
+        invalid_count   = sum(1 for f in dev_findings if f == "EVIDENCE_INVALID")
+        present_count   = sum(1 for f in dev_findings if f == "PRESENT")
+        partial_count   = sum(1 for f in dev_findings if f == "PARTIAL")
+        diff_loc_count  = sum(1 for f in dev_findings if f == "DIFFERENT_LOCATION")
+        absent_count    = sum(1 for f in dev_findings if f == "ABSENT")
 
-        if present_count > 0 and absent_count == 0:
+        if invalid_count >= 1:
+            dropped.append({
+                **diff,
+                "verification_status": "DROPPED",
+                "verdict_class": "dropped",
+                "evidence_quality": "INVALID",
+                "downgrade_reason": (
+                    "Evidence invalid for at least one deviating client "
+                    "(test code / non-existent file / out-of-range lines)."
+                ),
+            })
+        elif present_count > 0 and absent_count == 0:
             rejected.append({
                 **diff,
                 "verification_status": "REJECTED",
+                "verdict_class": "dropped",
                 "rejection_reason": (
                     f"Code evidence shows the feature described by guard "
                     f"'{diff.get('transition_guard', '?')}' is PRESENT in "
@@ -411,11 +521,11 @@ def _deterministic_verify(
             reclassified.append({
                 **diff,
                 "verification_status": "RECLASSIFIED",
+                "verdict_class": "lead",
                 "diff_type": "A",
                 "reclassify_reason": (
-                    f"Feature exists in deviating client(s) but in a "
-                    f"different module/location — naming/structural "
-                    f"difference, not a logic divergence."
+                    "Feature exists in deviating client(s) but in a different "
+                    "module/location — naming/structural difference."
                 ),
             })
         elif partial_count > 0 and absent_count == 0:
@@ -425,21 +535,25 @@ def _deterministic_verify(
             verified.append({
                 **diff,
                 "verification_status": "DOWNGRADED",
+                "verdict_class": "lead",
+                "evidence_quality": "WEAK",
                 "original_severity": severity,
                 "severity": new_sev,
             })
         else:
-            verified.append({**diff, "verification_status": "CONFIRMED"})
+            verified.append({**diff, "verification_status": "CONFIRMED",
+                             "verdict_class": "confirmed"})
 
     logger.info(
-        "[phase3_verify] wf=%s — verified=%d rejected=%d reclassified=%d",
-        current_wf, len(verified), len(rejected), len(reclassified),
+        "[phase3_verify] wf=%s — confirmed/lead=%d rejected=%d reclassified=%d dropped=%d",
+        current_wf, len(verified), len(rejected), len(reclassified), len(dropped),
     )
 
     return {
         "verified_b_diffs": verified,
         "rejected_b_diffs": rejected,
         "reclassified_to_a": reclassified,
+        "dropped_b_diffs": dropped,
     }
 
 
@@ -454,60 +568,92 @@ def _apply_verdicts(
     verified: list[dict] = []
     rejected: list[dict] = []
     reclassified: list[dict] = []
+    dropped: list[dict] = []
 
     for i, diff in enumerate(b_diffs):
         diff_id = f"B-{i + 1}"
         v = verdict_map.get(diff_id)
 
         if v is None:
-            verified.append({**diff, "verification_status": "CONFIRMED"})
+            verified.append({**diff, "verification_status": "CONFIRMED",
+                             "verdict_class": "confirmed"})
             continue
 
-        if v.verdict == "REJECTED":
+        common = {
+            "verification_confidence": v.confidence,
+            "is_production": v.is_production,
+            "line_verified": v.line_verified,
+            "exploit_chain_present": v.exploit_chain_present,
+        }
+
+        if v.verdict == "DROPPED":
+            dropped.append({
+                **diff,
+                "verification_status": "DROPPED",
+                "verdict_class": "dropped",
+                "evidence_quality": "INVALID",
+                "downgrade_reason": v.downgrade_reason or v.evidence_summary,
+                **common,
+            })
+        elif v.verdict == "REJECTED":
             rejected.append({
                 **diff,
                 "verification_status": "REJECTED",
+                "verdict_class": "dropped",
                 "rejection_reason": v.evidence_summary,
-                "verification_confidence": v.confidence,
+                **common,
             })
         elif v.verdict == "RECLASSIFIED":
             reclassified.append({
                 **diff,
                 "verification_status": "RECLASSIFIED",
+                "verdict_class": "lead",
                 "diff_type": "A",
                 "reclassify_reason": v.evidence_summary,
-                "verification_confidence": v.confidence,
                 "description": v.updated_description or diff.get("description", ""),
+                **common,
             })
         elif v.verdict == "DOWNGRADED":
             verified.append({
                 **diff,
                 "verification_status": "DOWNGRADED",
+                "verdict_class": "lead",
+                "evidence_quality": "WEAK",
                 "original_severity": diff.get("severity", ""),
                 "severity": v.new_severity or diff.get("severity", ""),
                 "description": v.updated_description or diff.get("description", ""),
                 "security_note": v.updated_security_note or diff.get("security_note", ""),
-                "verification_confidence": v.confidence,
+                "downgrade_reason": v.downgrade_reason,
+                **common,
             })
         else:  # CONFIRMED
-            updated = {**diff, "verification_status": "CONFIRMED"}
+            updated = {
+                **diff,
+                "verification_status": "CONFIRMED",
+                "verdict_class": (
+                    "confirmed" if v.exploit_chain_present and v.is_production
+                    and v.line_verified else "lead"
+                ),
+                "evidence_quality": "STRONG" if v.exploit_chain_present else "WEAK",
+                **common,
+            }
             if v.updated_description:
                 updated["description"] = v.updated_description
             if v.updated_security_note:
                 updated["security_note"] = v.updated_security_note
             if v.evidence_summary:
                 updated["evidence_summary"] = v.evidence_summary
-            updated["verification_confidence"] = v.confidence
             verified.append(updated)
 
     logger.info(
-        "[phase3_verify] wf=%s — verified=%d rejected=%d reclassified=%d",
-        current_wf, len(verified), len(rejected), len(reclassified),
+        "[phase3_verify] wf=%s — confirmed/lead=%d rejected=%d reclassified=%d dropped=%d",
+        current_wf, len(verified), len(rejected), len(reclassified), len(dropped),
     )
 
     return {
         "verified_b_diffs": verified,
         "rejected_b_diffs": rejected,
         "reclassified_to_a": reclassified,
+        "dropped_b_diffs": dropped,
     }
 

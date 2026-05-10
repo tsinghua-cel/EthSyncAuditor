@@ -23,6 +23,28 @@ For each candidate you discover, provide:
 3. **description**: One-sentence semantic description
 4. **evidence**: The source file path, function name, and line range where you found it
 
+### ⛔ Evidence Hard-Constraints (audit-review remediation)
+
+The system will *programmatically* re-read the file/lines you cite. Any
+finding whose evidence violates the rules below will be **silently dropped**
+by a downstream evidence gate, so do not waste your output budget on it.
+
+1. **Production code only.** Do **NOT** cite evidence from any of the
+   following: `tests/`, `test/`, `__tests__/`, `spec/`, `mocks/`,
+   `fixtures/`, `testdata/`, `testutil/`, `bench/`, `examples/`,
+   `src/bin/test_generator.rs`, files ending in `_test.go`, `*.test.ts`,
+   `*.spec.ts`, `Test.java`, `IT.java`, or Rust code inside a
+   `#[cfg(test)] mod tests { ... }` block.
+2. **File must exist.** The path is interpreted relative to
+   `code/<client>/`. If you are not sure the file exists at the cited
+   path, omit the candidate.
+3. **Line range must be precise.** Provide concrete `start_line` and
+   `end_line` integers (NOT placeholders such as 0, 1-1, or "N/A"). The
+   range must lie within the actual file length.
+4. Set `is_production_claim: true` and include a 1–10 line
+   `evidence_excerpt` quoted verbatim from the cited code so a reviewer
+   can sanity-check.
+
 Focus on the 7 core workflows described below. For each workflow, search relevant source code
 modules to discover Guards and Actions that the vocabulary may be missing.
 

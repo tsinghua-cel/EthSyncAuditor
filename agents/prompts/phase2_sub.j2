@@ -211,6 +211,40 @@ vulnerabilities** in {{ client_name }}'s {{ workflow_id }} implementation. These
 cross-client differences — they are **bugs or weaknesses in THIS client** that could cause
 consensus failures, chain splits, or safety violations regardless of what other clients do.
 
+#### ⛔ Production-only & PoC mandatory (audit-review remediation)
+
+A downstream **evidence gate** will deterministically re-read the code you cite and
+drop / downgrade any vulnerability that fails the rules below. Do not bother emitting
+findings that violate these — they will not appear in the report and will pollute the
+false-positive log.
+
+1. **NEVER** cite evidence from test code: `tests/`, `test/`, `__tests__/`, `spec/`,
+   `mocks/`, `fixtures/`, `testdata/`, `testutil/`, `bench/`, `examples/`,
+   `src/bin/test_generator.rs`, any `*_test.go`, `*.test.ts`, `*.spec.ts`,
+   `Test.java`, `IT.java`, or Rust code inside `#[cfg(test)] mod tests { ... }`.
+   Snippets explicitly marked `[is_production=False]` below MUST NOT be used as
+   primary evidence for a `[VULN]`.
+2. **NEVER** treat a `debug_assert!`, `assert!`, `expect("...")`, `unreachable!()`,
+   `panic!()`, or `unimplemented!()` as a remote-exploitable vulnerability on its own.
+   These are invariant guards, not attacker primitives.
+3. **EXPLOIT CHAIN IS MANDATORY** for every `[VULN]`. Provide an `exploit_chain`
+   field with at least:
+     - `actor`   — who triggers it (e.g. `remote peer`, `malicious validator`,
+                   `colluding builder`, `byzantine 1/3 set`).
+     - `trigger` — the concrete input or timing (`gossip a crafted block …`,
+                   `withhold attestation for slot N until …`, `race two newPayload
+                   responses …`).
+     - `path`    — ordered call chain `≥ 2` hops from the attacker-controlled
+                   entry point to the vulnerable code (use the qualified
+                   names you already extracted into states).
+     - `impact`  — concrete consensus-level outcome (`chain stall`, `finality
+                   stall`, `fork`, `mass slashing`, `node crash`, `OOM`).
+   Findings that lack any of these four MUST be downgraded to severity `MINOR`
+   and tagged in `security_note` as `[LEAD]` rather than `[VULN]`.
+4. If the only candidate snippets supplied below are marked `[is_production=False]`,
+   you MUST return an **empty** vulnerability list for this workflow — do not
+   invent production-side findings without supporting code.
+
 **Vulnerability Categories to Investigate:**
 
 1. **Missing or Insufficient Validation**
@@ -276,7 +310,7 @@ The following code snippets were retrieved from {{ client_name }}'s source code 
 states or transitions that are not supported by this code or other code you know about.
 
 {% for snippet in code_snippets %}
-### {{ snippet.function }} — `{{ snippet.file }}` L{{ snippet.lines }}
+### {{ snippet.function }} — `{{ snippet.file }}` L{{ snippet.lines }}{% if snippet.is_production is defined and not snippet.is_production %} **[is_production=False — DO NOT cite as VULN evidence]**{% endif %}
 ```{{ language }}
 {{ snippet.code }}
 ```

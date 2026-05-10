@@ -198,6 +198,12 @@ def main() -> None:
         write_diff_report(final_state)
         write_diff_report_json(final_state)
         write_false_positives_report(final_state)
+        # Audit-review remediation: flush per-finding evidence-validation log.
+        try:
+            from file_io.audit_logger import write_evidence_audit
+            write_evidence_audit(final_state)
+        except Exception:  # pragma: no cover — defensive
+            logger.exception("write_evidence_audit failed")
 
     save_checkpoint(
         final_state,

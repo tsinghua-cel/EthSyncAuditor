@@ -652,38 +652,57 @@ def write_diff_report(state: dict[str, Any]) -> Path:
         vuln_diffs = [d for d in b_diffs if "[consensus vuln]" in (d.get("security_note", "") or "").lower()]
         divergence_diffs = [d for d in b_diffs if "[consensus vuln]" not in (d.get("security_note", "") or "").lower()]
 
-        # ── 6a. Consensus Vulnerabilities ──────────────────────────────
+        # ── 6a. Consensus Vulnerabilities — bucketed by evidence-gate verdict ─
         if vuln_diffs:
+            confirmed_vulns = [d for d in vuln_diffs if d.get("verdict_class") == "confirmed"]
+            lead_vulns      = [d for d in vuln_diffs if d.get("verdict_class") == "lead"]
+            other_vulns     = [d for d in vuln_diffs if d.get("verdict_class") not in ("confirmed", "lead")]
+            # Anything still un-classified is treated as a lead (conservative).
+            lead_vulns += other_vulns
+
             lines.extend([
                 "## 🚨 Consensus-Impacting Vulnerabilities",
                 "",
-                "These are **potential vulnerabilities** in individual client "
-                "implementations that could cause consensus failures, chain splits, "
-                "or safety violations. They require **urgent investigation**.",
+                "Findings are bucketed by the deterministic **evidence gate**:",
                 "",
-                f"| Total Consensus Vulnerabilities | {len(vuln_diffs)} |",
-                "|---|---|",
+                f"- **Confirmed** ({len(confirmed_vulns)}) — production-code citation, "
+                "verified line range, complete exploit chain.",
+                f"- **Leads** ({len(lead_vulns)}) — partial evidence; worth investigating "
+                "but not yet a proven consensus bug.",
                 "",
             ])
-            v_idx = 1
-            for diff in vuln_diffs:
+
+            def _emit_vuln(label: str, diff: dict, idx: int) -> None:
                 lines.append(
-                    f"#### VULN-{v_idx}: {diff.get('workflow_id', '?')} / "
+                    f"#### {label}-{idx}: {diff.get('workflow_id', '?')} / "
                     f"{diff.get('state_id', '?')}"
                 )
                 lines.append("")
                 lines.append(f"- **Guard**: `{diff.get('transition_guard', '?')}`")
                 deviating = diff.get("deviating_clients", [])
                 if deviating:
-                    lines.append(
-                        f"- **Affected client(s)**: "
-                        f"{', '.join(deviating)}"
-                    )
+                    lines.append(f"- **Affected client(s)**: {', '.join(deviating)}")
+                lines.append(f"- **Severity**: {diff.get('severity', '?')}")
+                eq = diff.get("evidence_quality", "")
+                if eq:
+                    lines.append(f"- **Evidence quality**: {eq}")
+                lines.append(f"- **Production**: {diff.get('is_production', True)} | "
+                             f"**Line verified**: {diff.get('line_verified', False)}")
                 lines.append(f"- **Description**: {diff.get('description', '')}")
                 sec_note = diff.get("security_note", "")
                 if sec_note:
                     lines.append(f"- **⚠️ Security Note**: {sec_note}")
-                # Verification status
+                chain = diff.get("exploit_chain") or []
+                if chain:
+                    lines.append("- **Exploit chain**:")
+                    for step in chain:
+                        if isinstance(step, dict):
+                            lines.append(f"  - {step}")
+                        else:
+                            lines.append(f"  - {step}")
+                dr = diff.get("downgrade_reason", "")
+                if dr:
+                    lines.append(f"- **Downgrade reason**: {dr}")
                 vstatus = diff.get("verification_status", "")
                 if vstatus:
                     lines.append(f"- **Verification**: {vstatus}")
@@ -696,9 +715,19 @@ def write_diff_report(state: dict[str, Any]) -> Path:
                                 f"  - {client}: `{ev.get('file', '?')}` → "
                                 f"`{ev.get('function', '?')}` "
                                 f"L{ev.get('lines', [])}"
+                                f"{' [TEST]' if ev.get('is_production') is False else ''}"
                             )
                 lines.append("")
-                v_idx += 1
+
+            if confirmed_vulns:
+                lines.extend([f"### ✅ Confirmed Vulnerabilities ({len(confirmed_vulns)})", ""])
+                for i, d in enumerate(confirmed_vulns, 1):
+                    _emit_vuln("VULN", d, i)
+
+            if lead_vulns:
+                lines.extend([f"### 🟡 Leads — Worth Investigating ({len(lead_vulns)})", ""])
+                for i, d in enumerate(lead_vulns, 1):
+                    _emit_vuln("LEAD", d, i)
 
         # ── 6b. Cross-Client Structural Logic Differences ──────────────
         lines.extend([
@@ -885,17 +914,36 @@ def write_diff_report_json(state: dict[str, Any]) -> Path:
     # Add verification summary to JSON if present
     rejected_diffs = state.get("rejected_b_diffs", [])
     reclassified_diffs = state.get("reclassified_to_a", [])
-    n_confirmed = sum(1 for d in b_diffs if d.get("verification_status") == "CONFIRMED")
-    n_downgraded = sum(1 for d in b_diffs if d.get("verification_status") == "DOWNGRADED")
-    if n_confirmed + n_downgraded + len(rejected_diffs) + len(reclassified_diffs) > 0:
+    dropped_diffs = state.get("dropped_b_diffs", [])
+    evidence_audit = state.get("evidence_audit", [])
+
+    n_confirmed_status = sum(1 for d in b_diffs if d.get("verification_status") == "CONFIRMED")
+    n_downgraded       = sum(1 for d in b_diffs if d.get("verification_status") == "DOWNGRADED")
+    # Audit-review remediation: 3-tier verdict_class
+    n_confirmed = sum(1 for d in b_diffs if d.get("verdict_class") == "confirmed")
+    n_lead      = sum(1 for d in b_diffs if d.get("verdict_class") == "lead")
+    if (n_confirmed_status + n_downgraded + len(rejected_diffs)
+            + len(reclassified_diffs) + len(dropped_diffs)) > 0:
         report["verification_summary"] = {
-            "confirmed": n_confirmed,
-            "downgraded": n_downgraded,
-            "rejected": len(rejected_diffs),
+            "confirmed":    n_confirmed,
+            "lead":         n_lead,
+            "dropped":      len(dropped_diffs) + len(rejected_diffs),
+            "downgraded":   n_downgraded,
+            "rejected":     len(rejected_diffs),
             "reclassified": len(reclassified_diffs),
+            # Backwards-compatible alias.
+            "confirmed_status": n_confirmed_status,
         }
-        report["rejected_b_diffs"] = rejected_diffs
-        report["reclassified_to_a"] = reclassified_diffs
+        report["rejected_b_diffs"]   = rejected_diffs
+        report["reclassified_to_a"]  = reclassified_diffs
+        report["dropped_b_diffs"]    = dropped_diffs
+        if evidence_audit:
+            report["evidence_audit"] = evidence_audit
+        # Headline override.
+        report["executive_summary_headline"] = (
+            f"{n_confirmed} confirmed / {n_lead} leads / "
+            f"{len(dropped_diffs) + len(rejected_diffs)} dropped"
+        )
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False, default=str)
@@ -911,21 +959,26 @@ def write_false_positives_report(state: dict[str, Any]) -> Path | None:
     """
     rejected = state.get("rejected_b_diffs", [])
     reclassified = state.get("reclassified_to_a", [])
+    dropped = state.get("dropped_b_diffs", [])
 
-    if not rejected and not reclassified:
+    if not rejected and not reclassified and not dropped:
         return None
 
     config.OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
     path = config.OUTPUT_PATH / "Audit_False_Positives.md"
 
     lines: list[str] = [
-        "# EthAuditor — False Positives & Reclassified Diffs",
+        "# EthAuditor — False Positives, Reclassified & Dropped Diffs",
         "",
         f"**Generated at**: {datetime.now(timezone.utc).isoformat()}",
         "",
-        "This file contains B-class diffs that were **rejected** or "
-        "**reclassified** during Phase 3 verification. They are excluded "
-        "from the main Audit Diff Report.",
+        "This file contains B-class diffs excluded from the main report:",
+        "",
+        "- **Rejected** — production code shows the alleged divergence does not exist.",
+        "- **Reclassified** — moved to A-class (vocabulary/naming).",
+        "- **Dropped (evidence gate)** — evidence cited test/mock code, a non-existent "
+        "file, or an out-of-range line range; or `[CONSENSUS VULN]` claim lacked any "
+        "production-code path.",
         "",
     ]
 
@@ -969,12 +1022,49 @@ def write_false_positives_report(state: dict[str, Any]) -> Path | None:
                 lines.append(f"- **Reclassify Reason**: {reason}")
             lines.append("")
 
+    if dropped:
+        lines.extend([
+            f"## Dropped by Evidence Gate ({len(dropped)})",
+            "",
+            "These findings were silently removed by the deterministic "
+            "evidence gate. The cited code is in test / mock / generator "
+            "paths, references a non-existent file, has an out-of-range "
+            "line number, or is a `[CONSENSUS VULN]` claim with no "
+            "supporting production-code path.",
+            "",
+        ])
+        for i, diff in enumerate(dropped, 1):
+            lines.append(f"### DROP-{i}: {diff.get('workflow_id', '?')} / "
+                         f"{diff.get('state_id', '?')}")
+            lines.append("")
+            lines.append(f"- **Guard**: `{diff.get('transition_guard', '?')}`")
+            lines.append(f"- **Original severity**: {diff.get('severity', '?')}")
+            lines.append(f"- **Description**: {diff.get('description', '')}")
+            sec = diff.get("security_note", "")
+            if sec:
+                lines.append(f"- **Security note**: {sec}")
+            reason = diff.get("downgrade_reason", "")
+            if reason:
+                lines.append(f"- **Drop reason**: {reason}")
+            evidence = diff.get("evidence", {})
+            if evidence:
+                lines.append("- **Cited evidence**:")
+                for client, ev in evidence.items():
+                    if ev:
+                        flag = " [TEST]" if ev.get("is_production") is False else ""
+                        lines.append(
+                            f"  - {client}: `{ev.get('file', '?')}` → "
+                            f"`{ev.get('function', '?')}` "
+                            f"L{ev.get('lines', [])}{flag}"
+                        )
+            lines.append("")
+
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
     logger.info(
-        "[write_false_positives_report] → %s (rejected=%d reclassified=%d)",
-        path, len(rejected), len(reclassified),
+        "[write_false_positives_report] → %s (rejected=%d reclassified=%d dropped=%d)",
+        path, len(rejected), len(reclassified), len(dropped),
     )
     return path
 

@@ -36,34 +36,49 @@ _No evidence collected._
 
 For each B-class diff, issue a verdict:
 
-- **CONFIRMED**: Code evidence supports the diff. The logic divergence is genuine.
-  Keep severity as-is or adjust description/security_note for accuracy.
-- **REJECTED**: Code evidence shows the claimed missing feature DOES exist in the
-  deviating client(s). This is a false positive.
-- **DOWNGRADED**: The diff is real but its severity should be lower than originally
-  classified. Set `new_severity` to the correct level.
-- **RECLASSIFIED**: The diff is actually an A-class (vocabulary/naming) difference,
-  not a structural logic divergence.
+- **CONFIRMED**     — Production-code evidence supports the diff. The logic
+                      divergence is genuine. Keep severity as-is or adjust
+                      `description` / `security_note` for accuracy.
+- **REJECTED**      — Production-code evidence shows the claimed missing
+                      feature DOES exist in the deviating client(s). FP.
+- **DOWNGRADED**    — The diff is real but its severity is too high.
+                      Set `new_severity` to the correct level. Use this
+                      when the exploit chain is incomplete or the impact
+                      is over-stated.
+- **RECLASSIFIED**  — The diff is actually an A-class (vocabulary/naming)
+                      difference, not a structural logic divergence.
+- **DROPPED**       — The finding is unverifiable: every piece of cited
+                      evidence is in test/mock/generator code, references
+                      a non-existent file, or has an out-of-range line
+                      number; OR the finding is `[CONSENSUS VULN]` but
+                      no production-code path implements the alleged
+                      vulnerability. Dropped findings are excluded from
+                      the main report (they go into the false-positives
+                      / dropped log).
 
 For each verdict provide:
 - `diff_id` (e.g., "B-1")
-- `verdict` (CONFIRMED / REJECTED / DOWNGRADED / RECLASSIFIED)
+- `verdict` (CONFIRMED / REJECTED / DOWNGRADED / RECLASSIFIED / DROPPED)
 - `confidence` (0.0 to 1.0)
-- `evidence_summary` (brief reasoning)
+- `evidence_summary` (brief reasoning, citing file + line)
 - `new_severity` (only if DOWNGRADED)
-- `updated_description` (if verdict changes the understanding)
-- `updated_security_note` (if verdict changes the security assessment)
+- `updated_description`, `updated_security_note` (if needed)
+- `is_production`           — true iff retained evidence is production code
+- `line_verified`           — true iff at least one cited line range is valid
+- `exploit_chain_present`   — true iff a complete actor / trigger / path /
+                              impact chain exists for the finding
+- `downgrade_reason`        — required for DOWNGRADED / DROPPED
 
 **Special handling for `[CONSENSUS VULN]` diffs:**
-- Apply a **higher evidence bar** for REJECTED — only reject if you find concrete code
-  proving the vulnerability does NOT exist (e.g., the validation IS performed, the lock
-  IS held, the check IS in place). Absence of evidence is NOT evidence of absence.
-- For CONFIRMED consensus vulnerabilities, assess **exploitability**:
-  - Can the vulnerability be triggered remotely by a network peer?
-  - Does it require a malicious validator, or can any observer exploit it?
-  - What is the blast radius: single node crash, chain stall, or full consensus split?
-  - Add this assessment to `updated_security_note`
-- For DOWNGRADED, explain what mitigation exists and why the severity should be lower
-- NEVER reclassify a genuine consensus vulnerability to A-class
+- A `CONFIRMED` verdict requires **at least one production-code snippet** (NOT
+  test code) that implements the vulnerable path AND a complete exploit chain.
+  If either is missing → `DOWNGRADED` (with `new_severity = MAJOR` and
+  `[LEAD]` prefix in `updated_security_note`) or `DROPPED`.
+- "Absence of evidence is not evidence of absence" is **NOT** a defence:
+  vulnerability claims must be *positively* supported by production-code
+  citations. Unsupported VULN claims → `DROPPED`.
+- Test-code-only evidence → `DROPPED`. Out-of-range / non-existent file
+  evidence → `DROPPED`.
+- Never reclassify a *genuine* consensus vulnerability to A-class.
 
 Return a `VerifyMainResult` with `workflow_id` = "{{ workflow_id }}".

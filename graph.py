@@ -81,6 +81,8 @@ def make_initial_state() -> dict[str, Any]:
         "rejected_b_diffs": [],
         "reclassified_to_a": [],
         "verification_evidence": {},
+        "dropped_b_diffs": [],
+        "evidence_audit": [],
     }
 
 
@@ -484,6 +486,115 @@ def phase3_wf_verified_node(state: GlobalState) -> dict[str, Any]:
     return {"workflow_diff_reports": {wf: report}}
 
 
+def evidence_gate_node(state: GlobalState) -> dict[str, Any]:
+    """Deterministic post-LLM evidence gate (audit-review remediation).
+
+    Re-runs ``tools.evidence_validator.validate_finding`` over every
+    ``verified_b_diffs`` entry for the current workflow. Hard rules:
+
+      * Any per-client evidence in test/mock/generator code, in a
+        non-existent file, or with an out-of-range line range
+        ⇒ move finding to ``dropped_b_diffs``.
+      * ``[CONSENSUS VULN]`` finding without a complete exploit chain
+        and severity ≥ MAJOR ⇒ downgrade to ``MINOR`` / ``verdict_class
+        = "lead"`` and prefix ``security_note`` with ``[LEAD]``.
+      * ``verdict_class`` is recomputed (confirmed | lead | dropped).
+
+    The gate is intentionally idempotent — running it twice is a no-op
+    on already-classified findings.
+    """
+    from tools.evidence_validator import (
+        DOWNGRADE,
+        DROP,
+        validate_finding,
+    )
+
+    wf = state.get("current_workflow", "")
+    report = dict(state.get("workflow_diff_reports", {}).get(wf, {}))
+    b_diffs = list(report.get("b_class_diffs", []))
+
+    if not b_diffs:
+        return {}
+
+    keep: list[dict] = []
+    drop: list[dict] = []
+    audit: list[dict] = []
+
+    for i, diff in enumerate(b_diffs):
+        fv = validate_finding(diff)
+        diff_id = diff.get("diff_id") or f"B-{i + 1}"
+
+        per_client = {c: ev.to_dict() for c, ev in fv.per_client.items()}
+        audit.append({
+            "workflow_id": wf,
+            "diff_id": diff_id,
+            "stage": "evidence_gate",
+            "action": fv.action,
+            "evidence_quality": fv.evidence_quality,
+            "is_production": fv.is_production,
+            "line_verified": fv.line_verified,
+            "downgrade_reasons": fv.downgrade_reasons,
+            "per_client": per_client,
+        })
+
+        if fv.action == DROP:
+            drop.append({
+                **diff,
+                "verification_status": "DROPPED",
+                "verdict_class": "dropped",
+                "evidence_quality": "INVALID",
+                "is_production": False,
+                "downgrade_reason": "; ".join(fv.downgrade_reasons)
+                                    or "evidence gate: invalid evidence",
+            })
+            continue
+
+        new_diff = dict(diff)
+        new_diff["evidence_quality"]  = fv.evidence_quality or new_diff.get("evidence_quality", "")
+        new_diff["is_production"]     = fv.is_production
+        new_diff["line_verified"]     = fv.line_verified
+        if fv.downgrade_reasons:
+            new_diff["downgrade_reason"] = "; ".join(fv.downgrade_reasons)
+
+        is_vuln = "[CONSENSUS VULN]" in (new_diff.get("security_note") or "")
+        sev = (new_diff.get("severity") or "").upper()
+        chain_present = bool(new_diff.get("exploit_chain"))
+
+        if fv.action == DOWNGRADE or (is_vuln and not chain_present and sev in ("MAJOR", "CRITICAL")):
+            new_diff["verdict_class"] = "lead"
+            if sev == "CRITICAL":
+                new_diff["original_severity"] = sev
+                new_diff["severity"] = "MAJOR"
+            elif sev == "MAJOR":
+                new_diff["original_severity"] = sev
+                new_diff["severity"] = "MINOR"
+            note = new_diff.get("security_note", "")
+            if "[LEAD]" not in note:
+                new_diff["security_note"] = ("[LEAD] " + note).strip()
+        else:
+            new_diff["verdict_class"] = (
+                "confirmed" if fv.is_production and fv.line_verified
+                and (chain_present or not is_vuln) else "lead"
+            )
+        keep.append(new_diff)
+
+    report["b_class_diffs"] = keep
+    n_a = len(report.get("a_class_diffs", []))
+    n_b = len(keep)
+    report["logic_diff_rate"] = n_b / max(n_a + n_b, 1)
+
+    logger.info(
+        "[evidence_gate] wf=%s kept=%d dropped=%d audit_records=%d",
+        wf, len(keep), len(drop), len(audit),
+    )
+
+    return {
+        "workflow_diff_reports": {wf: report},
+        "dropped_b_diffs": drop,
+        "evidence_audit": audit,
+    }
+
+
 def final_aggregate_node(state: GlobalState) -> dict[str, Any]:
     wf_reports = state.get("workflow_diff_reports", {})
     all_a: list[dict] = []
@@ -541,6 +652,7 @@ def build_graph() -> StateGraph:
     g.add_node("phase3_verify_fanout", lambda _s: {})
     g.add_node("phase3_verify_sub", phase3_verify_sub_node)
     g.add_node("phase3_verify_main", phase3_verify_main_node)
+    g.add_node("evidence_gate", evidence_gate_node)
     g.add_node("phase3_wf_verified", phase3_wf_verified_node)
     g.add_node("final_aggregate", final_aggregate_node)
 
@@ -594,7 +706,8 @@ def build_graph() -> StateGraph:
     g.add_conditional_edges("phase3_verify_fanout", phase3_verify_fanout,
                             ["phase3_verify_sub"])
     g.add_edge("phase3_verify_sub", "phase3_verify_main")
-    g.add_edge("phase3_verify_main", "phase3_wf_verified")
+    g.add_edge("phase3_verify_main", "evidence_gate")
+    g.add_edge("evidence_gate", "phase3_wf_verified")
     g.add_edge("phase3_wf_verified", "workflow_scheduler")
 
     g.add_edge("final_aggregate", END)

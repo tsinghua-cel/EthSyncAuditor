@@ -654,3 +654,86 @@ workflows:
    - `version`, `client`, `guards`, `actions`, `workflows[*].id`, `states`, `transitions`
      as comparison-relevant;  
    - `generated_at` and `evidence` as informational (ignored for structural diff).
+
+---
+
+## 7. Audit-Review Remediation — Evidence Schema & Verdict Classes
+
+This section formalizes the additions introduced after the May 2026
+local-code-assessment review showed that 22 of 25 reported `[VULN]`
+findings cited test/mock/generator code, non-existent files, or
+out-of-range line ranges. The pipeline now records *provenance* and
+*validity* at every layer.
+
+### 7.1 Extended `evidence` block
+
+```yaml
+evidence:
+  file: "beacon_node/src/sync/range_sync.rs"   # path under code/<client>/
+  function: "process_chain_segment"
+  lines: [1234, 1290]                          # 1-based inclusive
+  is_production: true                          # set by evidence_validator
+  line_verified: true                          # both bounds inside file length
+  test_reason: ""                              # populated when is_production=false
+  excerpt: "fn process_chain_segment(...) { ... }"
+```
+
+`is_production = false` is set when the file path or in-file context
+matches any of:
+
+| Language   | Test markers                                                             |
+|------------|--------------------------------------------------------------------------|
+| Rust       | `tests/`, `#[cfg(test)] mod tests`, `#[test]`, `#[tokio::test]`, `src/bin/test_generator*`, `_tests.rs`, `benches/`, `examples/` |
+| Go         | `_test.go`, `testutil/`, `mock/`, `mocks/`, `testdata/`, `func TestXxx`, `func BenchmarkXxx`, `func FuzzXxx`, `func ExampleXxx` |
+| TypeScript | `__tests__/`, `*.test.ts`, `*.spec.ts`, `describe(/it(/test(`            |
+| Java       | `src/test/`, `*Test.java`, `*IT.java`, `@Test`, `@ParameterizedTest`     |
+| Generic    | `tests/`, `test/`, `spec/`, `fixtures/`, `mocks/`, `testing/`, `bench/`, `examples/` |
+
+### 7.2 New `DiffItem` fields
+
+| Field             | Type        | Meaning                                                                                                  |
+|-------------------|-------------|----------------------------------------------------------------------------------------------------------|
+| `exploit_chain`   | `list[dict]`| `{actor, trigger, path[], impact}` per step. CRITICAL/MAJOR findings without one are auto-downgraded.    |
+| `verdict_class`   | `confirmed \| lead \| dropped` | Output bucket after the deterministic evidence gate.                                |
+| `evidence_quality`| `STRONG \| WEAK \| INVALID`    | Aggregate quality of per-client evidence.                                           |
+| `downgrade_reason`| `str`       | Free text explaining why the gate downgraded / dropped the finding.                                       |
+| `is_production`   | `bool`      | `true` iff every retained per-client evidence is in production code.                                      |
+| `line_verified`   | `bool`      | `true` iff every retained per-client evidence has a valid line range.                                     |
+
+### 7.3 Verdict classes (3-tier output)
+
+* **`confirmed`** — production-code citation, verified line range, complete
+  exploit chain (for `[CONSENSUS VULN]`), and `evidence_quality = STRONG`.
+* **`lead`** — partial evidence; either the exploit chain is incomplete,
+  the cited code is production but only a weak invariant
+  (`debug_assert!`, `expect(...)`, `panic!`), or one client's evidence
+  was downgraded. Reported in the main report under "Leads".
+* **`dropped`** — every cited evidence is in test/mock/generator code,
+  references a non-existent file, has an out-of-range line range, or is a
+  `[CONSENSUS VULN]` claim with no production-code path. Routed to
+  `Audit_False_Positives.md` under the "Dropped by Evidence Gate" section
+  and excluded from the main report.
+
+### 7.4 Pipeline placement
+
+```
+phase3_verify_main → evidence_gate → phase3_wf_verified
+```
+
+`evidence_gate` is **deterministic**: it does not call any LLM; it re-runs
+`tools.evidence_validator.validate_finding` over the LLM verdict. Per-finding
+records are appended to `state["evidence_audit"]` and ultimately written to
+`output/audit_logs/evidence_audit_<timestamp>.jsonl`.
+
+### 7.5 Mandatory rejection list (Phase 2 prompt)
+
+The Phase 2 main prompt now instructs the agent to drop — not report — any
+candidate that matches one of 12 patterns: test-path evidence; weak
+invariants only; single match-arm not modelled; pure RPC/HTTP wrappers;
+read-only/metric-only differences; naming-only differences; non-existent
+files / out-of-range line ranges; exploit narratives requiring trusted
+component misbehaviour; mislabelled "race conditions"; vague "missing
+bound" claims; framing stricter validation as a weakness; cross-fork
+roadmap gaps. Mirror updates were made to the Phase 1 sub prompt and the
+Phase 3 verify prompts so that test-code snippets are visibly tagged
+`[TEST CODE — DO NOT USE]` when rendered to the LLM.

@@ -193,3 +193,32 @@ class AuditLogCallback(BaseCallbackHandler):
     @property
     def paths(self) -> list[str]:
         return list(self._paths)
+
+
+# ── Evidence-audit JSONL writer (audit-review remediation) ───────────────
+
+
+def write_evidence_audit(state: dict[str, Any]) -> str | None:
+    """Flush ``state["evidence_audit"]`` to a JSONL file under ``audit_logs/``.
+
+    Each record corresponds to one finding × client validation result and is
+    written exactly as produced by ``tools.evidence_validator`` /
+    ``graph.evidence_gate_node``. Returns the file path or ``None`` if the
+    audit channel is empty.
+    """
+    records = state.get("evidence_audit") or []
+    if not records:
+        return None
+
+    config.AUDIT_LOG_PATH.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    path = config.AUDIT_LOG_PATH / f"evidence_audit_{ts}.jsonl"
+
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str))
+            f.write("\n")
+
+    logger.info("[write_evidence_audit] → %s (%d records)", path, len(records))
+    return str(path)
+

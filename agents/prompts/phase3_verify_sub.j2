@@ -4,15 +4,19 @@ Client: **{{ client_name }}** | Workflow: **{{ workflow_id }}**
 
 ## Task
 
-Verify {{ b_diffs | length }} B-class diffs by searching {{ client_name }} source code.
+Verify {{ b_diffs | length }} B-class diffs by re-reading the actual {{ client_name }}
+source code that was already located on disk for you below.
 
 ## B-Class Diffs to Verify
 
 {% for diff in b_diffs %}
 ### {{ "B-" ~ loop.index }}: {{ diff.get("state_id", "?") }}
 - **Guard**: `{{ diff.get("transition_guard", "?") }}`
+- **Severity**: {{ diff.get("severity", "MAJOR") }}
 - **Description**: {{ diff.get("description", "") }}
 - **Deviating client(s)**: {{ diff.get("deviating_clients", []) | join(", ") }}
+- **Security note**: {{ diff.get("security_note", "") }}
+{% if diff.get("exploit_chain") %}- **Exploit chain (claimed)**: {{ diff.get("exploit_chain") }}{% endif %}
 {% endfor %}
 
 ## Code Evidence Found
@@ -21,7 +25,7 @@ Verify {{ b_diffs | length }} B-class diffs by searching {{ client_name }} sourc
 ### Evidence for {{ ev.diff_id }} (guard: `{{ ev.diff_guard }}`)
 {% if ev.code_snippets %}
 {% for snippet in ev.code_snippets[:5] %}
-**{{ snippet.file }}** -> `{{ snippet.function }}` L{{ snippet.lines }}
+**{{ snippet.file }}** -> `{{ snippet.function }}` L{{ snippet.lines }}{% if snippet.is_production is defined and not snippet.is_production %} **[TEST CODE — DO NOT USE]** ({{ snippet.test_reason or "non-production path" }}){% endif %}
 ```
 {{ snippet.snippet }}
 ```
@@ -33,17 +37,33 @@ _No code snippets found._
 
 ## Instructions
 
-For each diff, analyze code evidence and determine:
-- **PRESENT**: Feature IS implemented (diff is false positive)
-- **ABSENT**: No evidence of feature (diff is genuine)
-- **PARTIAL**: Incomplete implementation compared to reference
-- **DIFFERENT_LOCATION**: Feature exists in different module/workflow
+For each diff, judge the evidence and emit one of:
 
-**For diffs marked `[CONSENSUS VULN]` in security_note, apply stricter verification:**
-- Look for the specific code pattern described (missing validation, race condition, etc.)
-- Check if there are mitigations elsewhere (e.g., validation at a different layer)
-- Verify the attack scenario is actually reachable — are there guards upstream that prevent it?
-- If the vulnerability exists but has partial mitigation, report as **PARTIAL**
-- Provide the exact code path (file, function, line) where the vulnerability manifests
+- **PRESENT**             — Feature IS implemented in production code (diff is false positive)
+- **ABSENT**              — No evidence of feature in production code (diff is genuine)
+- **PARTIAL**             — Incomplete production implementation
+- **DIFFERENT_LOCATION**  — Feature exists but in a different production module
+- **EVIDENCE_INVALID**    — All available evidence cites test/mock/generator code,
+                            non-existent files, or out-of-range line numbers — i.e.
+                            the *original* finding cannot be supported by any
+                            production-code citation.
+
+Also emit, for each finding:
+
+- `evidence_quality`     ∈ {STRONG, WEAK, INVALID}
+- `production_path`      — file path under `code/{{ client_name }}/` of the
+                           strongest *production-code* snippet (or `null`)
+- `line_range_verified`  — true iff at least one cited line range fits inside
+                           the actual file bounds
+
+**For diffs whose `security_note` contains `[CONSENSUS VULN]` apply stricter rules:**
+- If no production-code snippet implements the alleged vulnerable code path,
+  return **EVIDENCE_INVALID** — do **not** assume "absence of evidence is
+  evidence of absence" for vulnerability claims.
+- Verify the exploit chain: is the cited code reachable from a network-facing
+  entry point? Is the trigger something a remote actor controls? If the
+  exploit chain is missing or unreachable, return **PARTIAL** with
+  `evidence_quality = WEAK`.
+- Snippets tagged `[TEST CODE — DO NOT USE]` MUST be ignored for VULN claims.
 
 Return a `VerifySubResult` with `client_name` = "{{ client_name }}".

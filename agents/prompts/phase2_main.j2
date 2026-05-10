@@ -106,11 +106,60 @@ Before reporting a B-class diff, verify:
 2. The claimed "missing" feature is truly absent, not just modeled differently or in another state
 3. The description accurately reflects ALL clients — do not claim "only X does this" if multiple clients do it
 
+#### ⛔ Mandatory Rejection List (audit-review remediation)
+
+You MUST drop — not report — any candidate finding that matches **any** of the
+patterns below. A downstream evidence gate will silently delete them anyway,
+and they crowd out genuine consensus issues.
+
+1. The cited code is in a test path (`tests/`, `test/`, `__tests__/`, `spec/`,
+   `mocks/`, `fixtures/`, `testdata/`, `bench/`, `examples/`, `*_test.go`,
+   `*.test.ts`, `*.spec.ts`, `Test.java`, `IT.java`, `src/bin/test_generator.rs`)
+   or inside a Rust `#[cfg(test)] mod tests { ... }` block.
+2. The "vulnerability" boils down to an existing `debug_assert!`,
+   `assert!`, `expect("...")`, `unreachable!()`, `panic!()`, or
+   `unimplemented!()` invariant. These are guards, not exploits.
+3. The finding describes a single match-arm / branch / status enum
+   variant being handled in one client and not modeled in another, with
+   no reachable mis-handling path.
+4. Pure RPC wrapper / HTTP-handler / config-getter differences with no
+   consensus-affecting logic.
+5. Pure state-query / read-only / metric-emit method differences.
+6. Naming-only differences (same actions, different identifier
+   spelling) — those are A-class, not B-class.
+7. The cited file does not exist under `code/<deviating_client>/`, or
+   the line range does not fit the file (e.g. `lines: [1, 1]` with no
+   real anchor, line numbers larger than the file length).
+8. The exploit narrative requires a *trusted* component to misbehave
+   (e.g. "if the local DB returns wrong data") with no remote attacker
+   step.
+9. Promise.all / Future::join / WaitGroup-style parallel writes labeled
+   "race condition" without an actual shared-mutable-state path.
+10. Vague "missing rate limit" / "missing bound" claims with no concrete
+    unbounded growth path identified.
+11. Observations about stricter validation in one client framed as a
+    weakness in the others, without showing the relaxed client accepts
+    a spec-invalid input.
+12. Cross-fork-version differences (Deneb vs Electra) where one client
+    has not yet implemented an upcoming fork — that is a roadmap gap,
+    not a consensus vulnerability.
+
 #### Severity Criteria
 
-**CRITICAL** — Consensus split, finality failure, or mass slashing risk
-**MAJOR** — Exploitable asymmetry (peer penalty, timeout, unique state/guard)
-**MINOR** — Architectural difference with limited direct security impact
+**CRITICAL** — Remotely triggerable in `< 1` epoch by a network peer **and**
+results in a finality / safety failure (chain split, mass slashing, finality
+stall ≥ 2 epochs, or full halt). Requires a populated `exploit_chain` with
+`actor`, `trigger`, `path` (≥ 2 hops), `impact` — otherwise auto-downgrade
+to MAJOR.
+
+**MAJOR** — Exploitable asymmetry that can be remotely induced (peer
+penalty asymmetry, reorg amplifier, eclipse-aiding heuristic, single-node
+crash from gossip). Requires `exploit_chain.actor` + `impact`; missing
+either ⇒ auto-downgrade to MINOR / `[LEAD]`.
+
+**MINOR** — Architectural difference, code-quality issue, partial spec
+implementation, or finding without a complete exploit chain. Should be
+tagged `[LEAD]` in `security_note`, not `[VULN]`.
 
 ### Step 4 — Compute Metrics
 

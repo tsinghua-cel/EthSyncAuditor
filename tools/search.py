@@ -102,8 +102,16 @@ def _bm25_search(
     client_name: str,
     top_k: int = 5,
     allowed_functions: set[str] | None = None,
+    *,
+    production_only: bool = True,
 ) -> list[SearchResult]:
-    """Search the BM25 index and return top_k results."""
+    """Search the BM25 index and return top_k results.
+
+    When ``production_only`` is True (default), documents whose metadata
+    has ``is_production == False`` are filtered out. Older indexes that
+    pre-date the audit-review remediation lack the field; they are kept
+    for backwards compatibility.
+    """
     bm25_data = _load_bm25(client_name)
     if bm25_data is None:
         return []
@@ -115,6 +123,12 @@ def _bm25_search(
     scores = bm25.get_scores(query_tokens)
 
     indexed: list[tuple[int, float]] = list(enumerate(scores))
+
+    if production_only:
+        indexed = [
+            (i, s) for i, s in indexed
+            if metadata_list[i].get("is_production", True)
+        ]
 
     if allowed_functions is not None:
         indexed = [
@@ -143,6 +157,8 @@ def _vector_search(
     client_name: str,
     top_k: int = 5,
     filter_dict: dict | None = None,
+    *,
+    production_only: bool = True,
 ) -> list[SearchResult]:
     """Search Chroma vector store and return top_k results."""
     db = _load_chroma(client_name)
@@ -150,9 +166,11 @@ def _vector_search(
         return []
 
     try:
+        # Over-fetch when filtering is enabled so we still hit ``top_k`` after drop.
+        k_eff = top_k * 3 if production_only else top_k
         results = db.similarity_search_with_relevance_scores(
             query,
-            k=top_k,
+            k=k_eff,
             filter=filter_dict,
         )
     except Exception:
@@ -161,11 +179,15 @@ def _vector_search(
 
     out: list[SearchResult] = []
     for doc, score in results:
+        if production_only and doc.metadata.get("is_production", True) is False:
+            continue
         out.append(SearchResult(
             content=doc.page_content,
             metadata=doc.metadata,
             score=float(score),
         ))
+        if len(out) >= top_k:
+            break
     return out
 
 
@@ -176,24 +198,19 @@ def search_codebase(
     query: str,
     client_name: str,
     top_k: int = 5,
+    *,
+    production_only: bool = True,
 ) -> list[SearchResult]:
     """Execute hybrid search (BM25 + vector) with weighted fusion.
 
-    Parameters
-    ----------
-    query : str
-        Natural-language or keyword query.
-    client_name : str
-        Which client's index to search.
-    top_k : int
-        Number of results to return after fusion.
-
-    Returns
-    -------
-    list[SearchResult]
+    By default, results known to live in test / mock / fixture / generator
+    code are filtered out (``production_only=True``). Callers that
+    explicitly want to inspect test code may opt out.
     """
-    bm25_results = _bm25_search(query, client_name, top_k=top_k)
-    vector_results = _vector_search(query, client_name, top_k=top_k)
+    bm25_results = _bm25_search(query, client_name, top_k=top_k,
+                                production_only=production_only)
+    vector_results = _vector_search(query, client_name, top_k=top_k,
+                                    production_only=production_only)
 
     return _fuse_results(bm25_results, vector_results, top_k)
 
@@ -207,6 +224,8 @@ def search_codebase_by_workflow(
     client_name: str,
     max_call_depth: int = 5,
     top_k: int = 10,
+    *,
+    production_only: bool = True,
 ) -> list[SearchResult]:
     """Call-graph directed hybrid search for LSG extraction.
 
@@ -218,12 +237,14 @@ def search_codebase_by_workflow(
     cg = _load_callgraph(client_name)
     if cg is None:
         logger.warning("No callgraph for %s — falling back to full search", client_name)
-        return search_codebase(query, client_name, top_k)
+        return search_codebase(query, client_name, top_k,
+                               production_only=production_only)
 
     entry_fns: list[str] = cg.get("entry_points", {}).get(workflow_id, [])
     if not entry_fns:
         logger.info("No entry points for %s/%s — full search fallback", client_name, workflow_id)
-        return search_codebase(query, client_name, top_k)
+        return search_codebase(query, client_name, top_k,
+                               production_only=production_only)
 
     # Build adjacency
     adjacency: dict[str, list[str]] = defaultdict(list)
@@ -247,8 +268,11 @@ def search_codebase_by_workflow(
                 queue.append((callee, depth + 1))
 
     # Search within reachable set
-    bm25_results = _bm25_search(query, client_name, top_k=top_k, allowed_functions=reachable)
-    vector_results = _vector_search(query, client_name, top_k=top_k)
+    bm25_results = _bm25_search(query, client_name, top_k=top_k,
+                                allowed_functions=reachable,
+                                production_only=production_only)
+    vector_results = _vector_search(query, client_name, top_k=top_k,
+                                    production_only=production_only)
 
     # Filter vector results to reachable set
     filtered_vector: list[SearchResult] = []
