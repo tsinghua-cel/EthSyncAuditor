@@ -338,6 +338,125 @@ def _normalize_severity(diff: dict) -> str:
     return _classify_severity_fallback(diff)
 
 
+# ── Audit-review remediation: cross-list consistency helpers ──────────
+
+
+def _diff_key(diff: dict) -> tuple:
+    """Stable identity for a B-class diff across kept / rejected / dropped
+    / reclassified lists.
+
+    Used to enforce the invariant: a diff that ended up in the kept
+    ``b_class_diffs`` set MUST NOT also appear in the FP / dropped /
+    reclassified lists. This invariant can otherwise be violated because
+    those lists use additive LangGraph reducers and accumulate across
+    Phase 2 ``b_iter`` re-runs (a diff can be dropped in iteration N then
+    re-accepted in iteration N+1, leaving a stale record in the dropped
+    list).
+    """
+    return (
+        (diff.get("workflow_id") or "").strip(),
+        (diff.get("state_id") or "").strip(),
+        (diff.get("transition_guard") or "").strip(),
+        tuple(sorted(diff.get("deviating_clients") or [])),
+    )
+
+
+def _filter_excluded_against_kept(
+    excluded: list[dict],
+    kept_keys: set[tuple],
+    bucket: str,
+) -> list[dict]:
+    """Drop entries from *excluded* whose key is also in *kept_keys*.
+
+    Logs a warning per dropped stale entry.
+    """
+    if not excluded:
+        return []
+    out: list[dict] = []
+    for d in excluded:
+        if _diff_key(d) in kept_keys:
+            logger.warning(
+                "[writer] Dropping stale '%s' record superseded by kept B-diff: "
+                "wf=%s state=%s guard=%s deviating=%s",
+                bucket,
+                d.get("workflow_id"), d.get("state_id"),
+                d.get("transition_guard"), d.get("deviating_clients"),
+            )
+            continue
+        out.append(d)
+    return out
+
+
+def _dedup_excluded(excluded: list[dict]) -> list[dict]:
+    """Deduplicate by ``_diff_key`` (keep first occurrence)."""
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for d in excluded or []:
+        k = _diff_key(d)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(d)
+    return out
+
+
+def _evidence_tag(diff: dict) -> str:
+    """Return ``full`` | ``partial`` | ``none`` based on per-client evidence."""
+    ev = diff.get("evidence") or {}
+    involved = diff.get("involved_clients") or []
+    has_any = any(ev.get(c) for c in (involved or ev.keys()))
+    if not has_any:
+        return "none"
+    if involved and sum(1 for c in involved if ev.get(c)) < len(involved):
+        return "partial"
+    return "full"
+
+
+def _reconcile_verdict_lists(
+    state_like_lists: dict[str, list[dict]],
+    kept_b_diffs: list[dict],
+) -> dict[str, list[dict]]:
+    """Single source of truth: filter excluded lists against kept set and
+    deduplicate. Returns a dict with the same keys as input."""
+    kept_keys = {_diff_key(d) for d in kept_b_diffs}
+    # Soft overlap: same (workflow, state, guard) but different
+    # deviating_clients. Not a contradiction, but very confusing in a
+    # human-readable report — log so it can be noticed and merged later.
+    kept_soft_keys = {
+        ((d.get("workflow_id") or "").strip(),
+         (d.get("state_id")    or "").strip(),
+         (d.get("transition_guard") or "").strip())
+        for d in kept_b_diffs
+    }
+    out: dict[str, list[dict]] = {}
+    for bucket, items in state_like_lists.items():
+        out[bucket] = _dedup_excluded(
+            _filter_excluded_against_kept(items, kept_keys, bucket)
+        )
+        for d in out[bucket]:
+            soft = ((d.get("workflow_id") or "").strip(),
+                    (d.get("state_id") or "").strip(),
+                    (d.get("transition_guard") or "").strip())
+            if soft in kept_soft_keys:
+                logger.warning(
+                    "[writer] Soft-overlap: '%s' entry shares "
+                    "(workflow=%s, state=%s, guard=%s) with a kept B-diff "
+                    "but has different deviating_clients=%s — readers may "
+                    "find this confusing; consider merging upstream.",
+                    bucket, *soft, d.get("deviating_clients"),
+                )
+    # Hard invariant — must hold after filter.
+    for bucket, items in out.items():
+        overlap = [d for d in items if _diff_key(d) in kept_keys]
+        if overlap:
+            raise AssertionError(
+                f"[writer] Consistency invariant violated: {len(overlap)} "
+                f"items in '{bucket}' still overlap kept b_class_diffs: "
+                f"{[_diff_key(d) for d in overlap]}"
+            )
+    return out
+
+
 def _deduplicate_b_diffs(b_diffs: list[dict]) -> list[dict]:
     """Deduplicate B-class diffs that describe the same structural difference.
 
@@ -423,7 +542,11 @@ def _generate_executive_summary(
     sev_counts = Counter(d.get("severity", "MAJOR") for d in b_diffs)
     n_critical = sev_counts.get("CRITICAL", 0)
     n_major = sev_counts.get("MAJOR", 0)
-    n_vuln = sum(1 for d in b_diffs if "[consensus vuln]" in (d.get("security_note", "") or "").lower())
+    n_vuln = sum(
+        1 for d in b_diffs
+        if "[consensus vuln]" in (d.get("security_note", "") or "").lower()
+        and d.get("verdict_class") == "confirmed"
+    )
 
     parts: list[str] = []
 
@@ -542,9 +665,36 @@ def write_diff_report(state: dict[str, Any]) -> Path:
     ])
 
     # ── 2. Summary Table ───────────────────────────────────────────────
+    # Reconcile excluded lists against the kept set BEFORE any counting,
+    # so headline numbers and the FP file agree with the main report.
+    _excluded = _reconcile_verdict_lists(
+        {
+            "rejected_b_diffs":  state.get("rejected_b_diffs", []),
+            "dropped_b_diffs":   state.get("dropped_b_diffs", []),
+            "reclassified_to_a": state.get("reclassified_to_a", []),
+        },
+        kept_b_diffs=b_diffs,
+    )
+    rejected_diffs     = _excluded["rejected_b_diffs"]
+    dropped_diffs      = _excluded["dropped_b_diffs"]
+    reclassified_diffs = _excluded["reclassified_to_a"]
+    # Mutate state so write_false_positives_report sees the same filtered
+    # lists (single source of truth).
+    state["rejected_b_diffs"]   = rejected_diffs
+    state["dropped_b_diffs"]    = dropped_diffs
+    state["reclassified_to_a"]  = reclassified_diffs
+
     # Count B-class by severity
     sev_counts = Counter(d.get("severity", "MAJOR") for d in b_diffs)
-    n_vuln = sum(1 for d in b_diffs if "[consensus vuln]" in (d.get("security_note", "") or "").lower())
+    # Audit-review fix: only items that survived Phase 3 + evidence gate
+    # AND are explicitly classified ``confirmed`` count as consensus vulns
+    # in the headline. Previously this counted every kept item whose
+    # ``security_note`` mentioned ``[CONSENSUS VULN]``, including leads.
+    n_vuln = sum(
+        1 for d in b_diffs
+        if "[consensus vuln]" in (d.get("security_note", "") or "").lower()
+        and d.get("verdict_class") == "confirmed"
+    )
     lines.extend([
         "## Summary",
         "",
@@ -562,8 +712,6 @@ def write_diff_report(state: dict[str, Any]) -> Path:
     ])
 
     # ── 2b. Verification Summary (Phase 3) ─────────────────────────────
-    rejected_diffs = state.get("rejected_b_diffs", [])
-    reclassified_diffs = state.get("reclassified_to_a", [])
     n_confirmed = sum(1 for d in b_diffs if d.get("verification_status") == "CONFIRMED")
     n_downgraded = sum(1 for d in b_diffs if d.get("verification_status") == "DOWNGRADED")
     has_verification = (
@@ -636,6 +784,12 @@ def write_diff_report(state: dict[str, Any]) -> Path:
                 f"{', '.join(diff.get('involved_clients', []))}"
             )
             lines.append(f"- **Rename directive**: {diff.get('description', '')}")
+            tag = _evidence_tag(diff)
+            if tag != "full":
+                lines.append(
+                    f"- **Evidence**: ⚠️ `{tag}` — this rename directive is "
+                    "not fully backed by per-client source citations."
+                )
             lines.append("")
     else:
         lines.extend([
@@ -912,9 +1066,20 @@ def write_diff_report_json(state: dict[str, Any]) -> Path:
     }
 
     # Add verification summary to JSON if present
-    rejected_diffs = state.get("rejected_b_diffs", [])
-    reclassified_diffs = state.get("reclassified_to_a", [])
-    dropped_diffs = state.get("dropped_b_diffs", [])
+    _excluded = _reconcile_verdict_lists(
+        {
+            "rejected_b_diffs":  state.get("rejected_b_diffs", []),
+            "dropped_b_diffs":   state.get("dropped_b_diffs", []),
+            "reclassified_to_a": state.get("reclassified_to_a", []),
+        },
+        kept_b_diffs=b_diffs,
+    )
+    rejected_diffs     = _excluded["rejected_b_diffs"]
+    reclassified_diffs = _excluded["reclassified_to_a"]
+    dropped_diffs      = _excluded["dropped_b_diffs"]
+    state["rejected_b_diffs"]  = rejected_diffs
+    state["dropped_b_diffs"]   = dropped_diffs
+    state["reclassified_to_a"] = reclassified_diffs
     evidence_audit = state.get("evidence_audit", [])
 
     n_confirmed_status = sum(1 for d in b_diffs if d.get("verification_status") == "CONFIRMED")
@@ -960,6 +1125,21 @@ def write_false_positives_report(state: dict[str, Any]) -> Path | None:
     rejected = state.get("rejected_b_diffs", [])
     reclassified = state.get("reclassified_to_a", [])
     dropped = state.get("dropped_b_diffs", [])
+
+    # Defensive reconcile (no-op if already reconciled by write_diff_report).
+    diff_report = state.get("diff_report", {})
+    kept_b_diffs = _deduplicate_b_diffs(diff_report.get("b_class_diffs", []))
+    _excluded = _reconcile_verdict_lists(
+        {
+            "rejected_b_diffs":  rejected,
+            "dropped_b_diffs":   dropped,
+            "reclassified_to_a": reclassified,
+        },
+        kept_b_diffs=kept_b_diffs,
+    )
+    rejected     = _excluded["rejected_b_diffs"]
+    dropped      = _excluded["dropped_b_diffs"]
+    reclassified = _excluded["reclassified_to_a"]
 
     if not rejected and not reclassified and not dropped:
         return None

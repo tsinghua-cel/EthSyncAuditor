@@ -94,6 +94,18 @@ class EvidenceVerdict:
     resolved_path: str = ""
     total_lines: int = 0
     excerpt: str = ""
+    # ── P1 hardening: claim-grounding (audit-review remediation) ─────
+    # ``True`` iff the cited snippet contains at least one significant
+    # identifier from the finding's guard / description / security_note.
+    # When the LLM stitches an unrelated source location into a finding
+    # (e.g. citing ``engineNewPayload`` for a claim about
+    # ``EnsureBalanceWithdrawalSourceAccountLimits``), this flag is False.
+    claim_grounded: bool = True
+    claim_hits: int = 0
+    claim_keywords_checked: int = 0
+    # Identifiers extracted from the snippet, used by the finding-level
+    # anti-stitching check.
+    snippet_identifiers: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,6 +136,73 @@ class FindingVerdict:
 # ---------------------------------------------------------------------------
 # Single-evidence validation
 # ---------------------------------------------------------------------------
+
+# ── P1 hardening: claim-grounding (audit-review remediation) ────────────────
+
+# Identifiers that are too generic to count as evidence-grounding hits.
+# These dilute every snippet, so excluding them is essential.
+_CLAIM_STOPWORDS = frozenset({
+    # English filler
+    "the", "and", "for", "with", "from", "into", "this", "that", "these",
+    "those", "when", "where", "what", "while", "which", "have", "has",
+    "does", "should", "must", "shall", "will", "would", "could", "may",
+    "than", "then", "after", "before", "upon", "their", "them", "they",
+    # generic concepts
+    "true", "false", "none", "null", "value", "values", "result", "block",
+    "blocks", "slot", "slots", "epoch", "epochs", "state", "states",
+    "node", "nodes", "client", "clients", "validator", "validators",
+    "beacon", "BeaconNode", "consensus", "CONSENSUS", "VULN", "LEAD",
+    "vulnerability", "vulnerabilities", "implement", "implements",
+    "implementation", "implementations", "different", "differently",
+    "missing", "present", "absent", "explicit", "explicitly", "implicit",
+    "transition", "transitions", "guard", "guards", "action", "actions",
+    "workflow", "workflows", "deviating", "involved",
+    # client names
+    "prysm", "lighthouse", "grandine", "teku", "lodestar",
+})
+
+
+def _claim_keywords(diff: dict[str, Any]) -> set[str]:
+    """Extract significant identifiers a supporting snippet must mention.
+
+    Pulls CamelCase / snake_case / MACRO_CASE tokens of length ≥ 4 from
+    the finding's ``transition_guard`` (highest signal), plus
+    ``description`` and ``security_note``. Common English filler and
+    domain-generic words are removed via :data:`_CLAIM_STOPWORDS`.
+    """
+    parts = [
+        diff.get("transition_guard") or "",
+        diff.get("description") or "",
+        diff.get("security_note") or "",
+    ]
+    text = " ".join(parts)
+    raw = re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", text)
+    out: set[str] = set()
+    for tok in raw:
+        if tok in _CLAIM_STOPWORDS:
+            continue
+        if tok.lower() in _CLAIM_STOPWORDS:
+            continue
+        out.add(tok)
+    return out
+
+
+def _snippet_identifiers(snippet: str) -> set[str]:
+    """Identifier-like tokens occurring in *snippet* (length ≥ 4)."""
+    if not snippet:
+        return set()
+    return {t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", snippet)
+            if t not in _CLAIM_STOPWORDS}
+
+
+def _grounding_hits(snippet: str, keywords: set[str]) -> tuple[int, list[str]]:
+    """Return ``(hit_count, hit_list)`` — case-insensitive substring match."""
+    if not snippet or not keywords:
+        return 0, []
+    s_lower = snippet.lower()
+    hits = [k for k in keywords if k.lower() in s_lower]
+    return len(hits), hits
+
 
 def _client_language(client: str) -> str | None:
     try:
@@ -161,12 +240,21 @@ def _normalize_lines(raw: Any) -> tuple[int, int]:
 def validate_evidence(
     evidence: dict[str, Any] | None,
     client: str,
+    *,
+    claim_keywords: set[str] | None = None,
+    min_grounding_hits: int = 1,
 ) -> EvidenceVerdict:
     """Validate one evidence block for *client*.
 
     *evidence* is the dict shape used throughout the pipeline::
 
         {"file": "...", "function": "...", "lines": [start, end]}
+
+    When *claim_keywords* is provided, the cited snippet must contain at
+    least *min_grounding_hits* of those tokens (case-insensitive
+    substring). Findings whose snippet has zero overlap with the claim
+    are dropped; findings with partial overlap are downgraded. This is
+    the anti-stitching gate.
     """
     verdict = EvidenceVerdict()
 
@@ -252,6 +340,33 @@ def validate_evidence(
         )
         return verdict
 
+    # 5) Claim-grounding (anti-stitching) — snippet must mention the
+    #    finding it claims to support.
+    if claim_keywords:
+        verdict.claim_keywords_checked = len(claim_keywords)
+        hits, hit_list = _grounding_hits(snippet, claim_keywords)
+        verdict.claim_hits = hits
+        verdict.snippet_identifiers = sorted(_snippet_identifiers(snippet))[:64]
+        if hits == 0:
+            verdict.claim_grounded = False
+            verdict.action = DROP
+            verdict.downgrade_reason = (
+                "snippet does not mention any claim keyword "
+                f"(checked {len(claim_keywords)} tokens from guard/description). "
+                "Likely an unrelated source location stitched into the finding."
+            )
+            return verdict
+        if hits < min_grounding_hits:
+            verdict.claim_grounded = False
+            verdict.action = DOWNGRADE
+            verdict.downgrade_reason = (
+                f"weak claim-grounding: only {hits} of "
+                f"{len(claim_keywords)} claim tokens present in snippet "
+                f"(required ≥ {min_grounding_hits})"
+            )
+            return verdict
+        verdict.claim_grounded = True
+
     return verdict
 
 
@@ -315,6 +430,18 @@ def validate_finding(
 
     evidence_map = diff.get("evidence", {}) or {}
 
+    # ── P1 hardening: claim-grounding ────────────────────────────────
+    claim_keywords = _claim_keywords(diff)
+    is_consensus_vuln = "[CONSENSUS VULN]" in (diff.get("security_note") or "")
+    # Vulnerabilities require a stronger snippet ↔ claim overlap.
+    min_hits = 2 if is_consensus_vuln else 1
+    # If the claim itself yielded no significant identifiers (rare —
+    # mostly happens when guard is "true"/"TRUE" and the description is
+    # vague), we cannot ground anything; skip the gate to avoid false
+    # drops. The exploit-chain check below still applies.
+    if len(claim_keywords) < 2:
+        claim_keywords = set()
+
     n_drop = 0
     n_downgrade = 0
     for client in clients:
@@ -322,7 +449,11 @@ def validate_finding(
         ev_dict = ev if isinstance(ev, dict) else (
             ev.model_dump() if hasattr(ev, "model_dump") else None
         )
-        per = validate_evidence(ev_dict, client)
+        per = validate_evidence(
+            ev_dict, client,
+            claim_keywords=claim_keywords or None,
+            min_grounding_hits=min_hits,
+        )
         fv.per_client[client] = per
         if per.action == DROP:
             n_drop += 1
@@ -331,7 +462,6 @@ def validate_finding(
             n_downgrade += 1
             fv.downgrade_reasons.append(f"{client}: {per.downgrade_reason}")
 
-    is_consensus_vuln = "[CONSENSUS VULN]" in (diff.get("security_note") or "")
     severity = (diff.get("severity") or "").upper()
 
     if n_drop == len(clients):
@@ -359,6 +489,34 @@ def validate_finding(
     if n_downgrade > 0 or n_drop > 0:
         fv.action = DOWNGRADE
         fv.evidence_quality = "WEAK"
+
+    # ── P1 hardening: anti-stitching ────────────────────────────────
+    # For consensus-vuln claims with multiple supporting snippets, the
+    # snippets must share at least one significant identifier — otherwise
+    # they describe unrelated code paths that the LLM concatenated into
+    # a fake exploit chain.
+    if is_consensus_vuln:
+        kept = [
+            (c, p) for c, p in fv.per_client.items()
+            if p.action != DROP and p.snippet_identifiers
+        ]
+        if len(kept) >= 2:
+            common: set[str] | None = None
+            for _, per in kept:
+                ids = set(per.snippet_identifiers)
+                common = ids if common is None else (common & ids)
+                if not common:
+                    break
+            if not common:
+                fv.action = DROP
+                fv.evidence_quality = "INVALID"
+                fv.is_production = False
+                fv.downgrade_reasons.append(
+                    "anti-stitching: per-client snippets share no common "
+                    "identifier — evidence chain looks fabricated from "
+                    "unrelated source locations"
+                )
+                return fv
 
     # Exploit-chain check — only enforce on MAJOR/CRITICAL.
     if require_exploit_chain and severity in ("MAJOR", "CRITICAL"):
