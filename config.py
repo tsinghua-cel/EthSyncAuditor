@@ -24,6 +24,13 @@ VERIFY_ENABLED: bool = True
 VERIFY_SEARCH_TOP_K: int = 20
 VERIFY_CONFIDENCE_THRESHOLD: float = 0.5
 
+
+# LLM provider & model
+LLM_PROVIDER: str = "anthropic"          # "anthropic" | "gemini"
+LLM_MODEL: str = "claude-opus-4-6"
+GEMINI_MODEL: str = "gemini-2.5-flash"
+
+
 # Clients (canonical order)
 CLIENT_NAMES: list[str] = [
     "prysm",
@@ -121,11 +128,6 @@ EMBEDDING_MODELS: list[str] = [
     "text-embedding-3-large",
     "all-MiniLM-L6-v2",
 ]
-
-# LLM provider & model
-LLM_PROVIDER: str = "anthropic"          # "anthropic" | "gemini"
-LLM_MODEL: str = "claude-opus-4-6"
-GEMINI_MODEL: str = "gemini-2.5-flash"
 
 # API base URLs (empty = provider default; CLI / env vars override)
 ANTHROPIC_BASE_URL: str = ""
