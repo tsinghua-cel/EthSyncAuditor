@@ -14,6 +14,8 @@ load_dotenv()
 
 from config import (
     ANTHROPIC_BASE_URL,
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_MODEL,
     GEMINI_BASE_URL,
     GEMINI_MODEL,
     LLM_MODEL,
@@ -48,6 +50,25 @@ def _proxy_url() -> str | None:
             or os.environ.get("ALL_PROXY"))
 
 
+class _DeepSeekStructuredOutputWrapper:
+    """Wraps ChatOpenAI so that ``with_structured_output`` defaults to
+    ``method="function_calling"``, which DeepSeek's API supports (unlike
+    the ``json_schema`` mode, and unlike ``json_mode`` which requires the
+    word "json" in every prompt).  All other attribute accesses are
+    transparently delegated to the underlying ChatOpenAI instance."""
+
+    def __init__(self, chat_openai: Any) -> None:
+        self._llm = chat_openai
+
+    def with_structured_output(
+        self, schema: Any, *, method: str = "function_calling", **kwargs: Any
+    ) -> Any:
+        return self._llm.with_structured_output(schema, method=method, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._llm, name)
+
+
 def _init_llm(model_name: str, *, provider: str, base_url: str) -> Any:
     """Instantiate an LLM for *provider* or return ``None`` to fall back to mock."""
     if provider == "gemini":
@@ -70,6 +91,35 @@ def _init_llm(model_name: str, *, provider: str, base_url: str) -> Any:
         logger.info("Initializing Gemini LLM model=%s", model_name)
         return ChatGoogleGenerativeAI(**kwargs)
 
+    if provider == "deepseek":
+        try:
+            from langchain_openai import ChatOpenAI  # type: ignore[import-untyped]
+        except ImportError:
+            logger.warning("langchain-openai not installed; falling back to mock")
+            return None
+        if not os.environ.get("DEEPSEEK_API_KEY"):
+            logger.warning("DEEPSEEK_API_KEY not set; falling back to mock")
+            return None
+
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "api_key": os.environ["DEEPSEEK_API_KEY"],
+            "base_url": base_url or os.environ.get("DEEPSEEK_BASE_URL", ""),
+            # DeepSeek's chat model has thinking enabled by default, but
+            # thinking mode conflicts with tool_choice (used by
+            # function_calling structured output).  Disable it explicitly.
+            "model_kwargs": {"extra_body": {"thinking": {"type": "disabled"}}},
+        }
+        logger.info("Initializing DeepSeek LLM model=%s", model_name)
+        llm = ChatOpenAI(**kwargs)
+        # DeepSeek does not support OpenAI's json_schema response_format
+        # (which langchain-openai uses by default in with_structured_output),
+        # and json_mode requires the word "json" to appear in every prompt.
+        # We wrap the LLM to force method="function_calling" instead, which
+        # uses tool-calling — fully supported by DeepSeek once thinking is
+        # disabled.
+        return _DeepSeekStructuredOutputWrapper(llm)
+
     # anthropic (default)
     try:
         from langchain_anthropic import ChatAnthropic  # type: ignore[import-untyped]
@@ -91,7 +141,7 @@ def _init_llm(model_name: str, *, provider: str, base_url: str) -> Any:
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="EthSyncAuditor — LSG extraction & comparison")
     p.add_argument("--mock", action="store_true", help="Run with mock agents (no LLM)")
-    p.add_argument("--provider", choices=["anthropic", "gemini"], default=None,
+    p.add_argument("--provider", choices=["anthropic", "gemini", "deepseek"], default=None,
                    help="LLM provider (default: config.LLM_PROVIDER)")
     p.add_argument("--resume", action="store_true",
                    help="Resume from the latest checkpoint")
@@ -107,6 +157,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Custom API base URL for Anthropic")
     p.add_argument("--gemini-base-url", default=None,
                    help="Custom API base URL for Gemini")
+    p.add_argument("--deepseek-base-url", default=None,
+                   help="Custom API base URL for DeepSeek")
     p.add_argument("--skip-verify", action="store_true",
                    help="Skip Phase 3 B-class verification")
     return p
@@ -175,9 +227,15 @@ def main() -> None:
     use_mock = args.mock
     llm: Any = None
     if not use_mock:
-        model_name = GEMINI_MODEL if provider == "gemini" else LLM_MODEL
-        base_url = (args.gemini_base_url or GEMINI_BASE_URL) if provider == "gemini" \
-                   else (args.anthropic_base_url or ANTHROPIC_BASE_URL)
+        if provider == "gemini":
+            model_name = GEMINI_MODEL
+            base_url = args.gemini_base_url or GEMINI_BASE_URL
+        elif provider == "deepseek":
+            model_name = DEEPSEEK_MODEL
+            base_url = args.deepseek_base_url or DEEPSEEK_BASE_URL
+        else:
+            model_name = LLM_MODEL
+            base_url = args.anthropic_base_url or ANTHROPIC_BASE_URL
         llm = _init_llm(model_name, provider=provider, base_url=base_url)
         if llm is None:
             logger.warning("LLM unavailable; switching to mock mode")
