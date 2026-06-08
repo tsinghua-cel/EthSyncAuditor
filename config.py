@@ -68,52 +68,94 @@ LANGUAGE_GRAMMARS: dict[str, tuple[str, str]] = {
 
 # Entry-point keyword heuristics (lowercase, underscores stripped before match).
 # Keep keywords specific enough to avoid colliding with cryptographic primitives.
+# NOTE: entry-point matching is a substring test against each symbol's
+# *function name*, lowercased with underscores stripped (see
+# tools/preprocessor.py:_build_callgraph). Keywords must therefore be
+# lowercase, underscore-free, and correspond to real FUNCTION-name fragments
+# (struct/class/type names never match). Each list is calibrated so that
+# every client (prysm/lighthouse/grandine/teku/lodestar) has at least one
+# real entry point per workflow; overly generic fragments are avoided so the
+# reachable set stays workflow-scoped.
 ENTRY_POINT_KEYWORDS: dict[str, list[str]] = {
     "initial_sync": [
-        "initialsync", "runinitial", "startinitial",
-        "rangesync", "syncingchain", "syncchain",
-        "forwardsync", "peersync", "syncmanager",
-        "syncblockbyrange",
+        "initialsync", "rangesync", "syncrange",
+        "forwardsync", "peersync", "syncchain",
+        "requestblocks", "fetchblocks", "backfill",
     ],
     "regular_sync": [
-        "regularsync", "runregular", "gossipsync",
-        "receiveblock", "receiveattestation", "processblock",
-        "gossiphandler", "blockimporter", "gossipvalidator",
-        "handlereorg", "onreorg",
+        "regularsync", "gossipsync", "gossiphandler",
+        "gossipvalidator", "onblock", "importblock",
+        "receiveblock", "receiveattestation", "onattestation",
+        "reorg",
     ],
     "checkpoint_sync": [
-        "checkpointsync", "runcheckpoint",
-        "backfillsync", "backfillbatch",
-        "weaksubjectivity",
+        "checkpointsync", "checkpoint", "anchor",
+        "weaksubjectivity", "backfill", "finalizedstate",
     ],
     "block_generate": [
-        "proposeblock", "buildblock", "produceblock",
-        "builderapi", "builderbid", "mevboost",
-        "enginegetpayload", "buildergetpayload",
-        "blockproductionduty", "blockservice",
+        "proposeblock", "produceblock", "buildblock",
+        "getpayload", "blockproposal", "proposerduty",
+        "builderbid", "enginegetpayload",
     ],
     "attestation_generate": [
-        "submitattestation", "createattestation",
-        "attestationservice", "attestationduty", "attestationproduction",
-        "performattestationduty",
-        "slashingprotection", "issafetoattest",
+        "submitattestation", "createattestation", "produceattestation",
+        "buildattestation", "signattestation", "attesterduty",
+        "attestationduty", "attestationproduction", "slashingprotection",
     ],
     "aggregate": [
-        "aggregateandproof", "submitaggregate",
-        "aggregationduty", "aggregatorselection",
-        "produceaggregate", "publishaggregate",
-        "computeaggregate",
+        "aggregateandproof", "isaggregator", "selectionproof",
+        "aggregatorselection", "aggregationduty", "submitaggregate",
+        "publishaggregate", "createaggregate",
     ],
     "execute_layer_relation": [
-        "engineapi", "executionengine", "forkchoiceupdate",
-        "newpayload", "notifynewpayload", "payloadstatus",
-        "optimisticsync", "optimisticimport",
-        "invalidpayload", "invalidateblock",
+        "executionengine", "forkchoiceupdate", "newpayload",
+        "notifynewpayload", "payloadstatus", "isoptimistic",
+        "optimisticsync", "invalidpayload", "invalidateblock",
     ],
 }
 
 # Per-client entry-point overrides (client → workflow → list[fn])
 ENTRY_POINT_OVERRIDES: dict[str, dict[str, list[str]]] = {}
+
+# Workflow → file-path fragments (lowercased substrings of the client-relative
+# source path). A symbol is also treated as a workflow entry point when its
+# file lives in a directory that clearly belongs to the workflow, even if the
+# function name does not match a keyword. This is the strongest workflow
+# signal (module layout) and complements the function-name keywords above —
+# it is especially useful where a client's entry functions have generic names
+# (run/start/handle/process) but live in a workflow-specific package.
+# Keep fragments specific to a workflow's module to avoid bleeding across
+# workflows; matching is additive to ENTRY_POINT_KEYWORDS, never a replacement.
+ENTRY_POINT_PATH_MARKERS: dict[str, list[str]] = {
+    "initial_sync": [
+        "initial-sync", "initial_sync", "range_sync", "rangesync",
+        "sync/range", "forward_sync", "backfill",
+    ],
+    "regular_sync": [
+        "gossip", "blockimporter", "block_processor",
+        "networkbeaconprocessor",
+    ],
+    "checkpoint_sync": [
+        "checkpoint", "weak_subjectivity", "weaksubjectivity",
+    ],
+    "block_generate": [
+        "block_producer", "blockproducer", "proposer",
+        "validator/client/propose", "/propose", "block_service",
+        "blockproduction",
+    ],
+    "attestation_generate": [
+        "attestation_service", "attestationservice",
+        "validator/client/attest", "/attest", "slashing_protection",
+        "slashingprotection",
+    ],
+    "aggregate": [
+        "aggregat",
+    ],
+    "execute_layer_relation": [
+        "execution_layer", "executionlayer", "execution/engine",
+        "executionengine", "/engine/", "engine_api",
+    ],
+}
 
 # Embedding models tried in order; the first available one wins
 EMBEDDING_MODELS: list[str] = [

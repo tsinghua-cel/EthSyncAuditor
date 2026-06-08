@@ -79,6 +79,7 @@ def make_initial_state() -> dict[str, Any]:
         "wf_iteration_history": [],
         "verified_b_diffs": [],
         "rejected_b_diffs": [],
+        "unverified_b_diffs": [],
         "reclassified_to_a": [],
         "verification_evidence": {},
     }

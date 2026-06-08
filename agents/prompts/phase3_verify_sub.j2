@@ -17,11 +17,16 @@ Verify {{ b_diffs | length }} B-class diffs by searching {{ client_name }} sourc
 
 ## Code Evidence Found
 
+Each snippet below has a stable **evidence id**. When you report a finding,
+you MUST reference the ids of the snippets you actually relied on (in the
+`code_evidence` you echo back, keep the same `id`). Do NOT invent file paths,
+line numbers, or snippets that are not listed here.
+
 {% for ev in evidence_per_diff %}
 ### Evidence for {{ ev.diff_id }} (guard: `{{ ev.diff_guard }}`)
 {% if ev.code_snippets %}
 {% for snippet in ev.code_snippets[:5] %}
-**{{ snippet.file }}** -> `{{ snippet.function }}` L{{ snippet.lines }}
+- **[{{ snippet.id }}]** `{{ snippet.file }}` -> `{{ snippet.function }}` L{{ snippet.lines }}
 ```
 {{ snippet.snippet }}
 ```
@@ -33,17 +38,30 @@ _No code snippets found._
 
 ## Instructions
 
-For each diff, analyze code evidence and determine:
+For each diff, analyze ONLY the code evidence above and determine:
 - **PRESENT**: Feature IS implemented (diff is false positive)
 - **ABSENT**: No evidence of feature (diff is genuine)
 - **PARTIAL**: Incomplete implementation compared to reference
 - **DIFFERENT_LOCATION**: Feature exists in different module/workflow
 
+**Grounding rules (mandatory):**
+- Base every finding on the snippets shown above. If the snippets do not
+  actually contain the logic the diff is about (e.g. they are off-topic,
+  only show API routing, or only show field initialization), do NOT claim
+  PRESENT or ABSENT — say so in `explanation` and prefer leaving the finding
+  unsupported rather than guessing.
+- A line range that does not contain the described logic is NOT valid
+  evidence. Call this out explicitly in `explanation`.
+- Quote the exact condition/branch in `explanation`; do not paraphrase code
+  you cannot see.
+
 **For diffs marked `[CONSENSUS VULN]` in security_note, apply stricter verification:**
 - Look for the specific code pattern described (missing validation, race condition, etc.)
 - Check if there are mitigations elsewhere (e.g., validation at a different layer)
 - Verify the attack scenario is actually reachable — are there guards upstream that prevent it?
+- A vulnerability whose trigger comes only from operator configuration or
+  local startup (not a remote/attacker-controlled input) is NOT a consensus
+  vulnerability — note this in `explanation`.
 - If the vulnerability exists but has partial mitigation, report as **PARTIAL**
-- Provide the exact code path (file, function, line) where the vulnerability manifests
 
 Return a `VerifySubResult` with `client_name` = "{{ client_name }}".

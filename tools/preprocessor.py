@@ -24,6 +24,7 @@ from config import (
     CODE_BASE_PATH,
     ENTRY_POINT_KEYWORDS,
     ENTRY_POINT_OVERRIDES,
+    ENTRY_POINT_PATH_MARKERS,
     LANGUAGE_GRAMMARS,
     PREPROCESS_PATH,
     WORKFLOW_IDS,
@@ -299,20 +300,55 @@ def _build_callgraph(client_name: str, symbols: list[SymbolInfo]) -> CallGraph:
         file_lower = sym.file.lower()
         return any(marker in file_lower for marker in _TEST_PATH_MARKERS)
 
+    def _norm(text: str) -> str:
+        # Lowercase and strip separators so keywords match across naming
+        # styles and qualified names (e.g. Go receiver "(*Service).recvBlock").
+        out = text.lower()
+        for ch in ("_", "(", ")", "*", ".", " ", "&", "[", "]"):
+            out = out.replace(ch, "")
+        return out
+
     for wf_id in WORKFLOW_IDS:
         if wf_id in overrides:
             entry_points[wf_id] = overrides[wf_id]
             continue
 
         keywords = ENTRY_POINT_KEYWORDS.get(wf_id, [])
+        path_markers = ENTRY_POINT_PATH_MARKERS.get(wf_id, [])
+        matched_by_name = 0
+        matched_by_path = 0
         matched: list[str] = []
+        seen: set[str] = set()
         for sym in symbols:
             if _is_test_symbol(sym):
                 continue
-            fn_lower = sym.function_name.lower().replace("_", "")
-            if any(kw in fn_lower for kw in keywords):
-                matched.append(sym.qualified_name)
+            # Signal 1+2: function name or qualified name (catches receiver /
+            # class-qualified names) contains a workflow keyword.
+            name_hit = False
+            if keywords:
+                fn_norm = _norm(sym.function_name)
+                qn_norm = _norm(sym.qualified_name)
+                name_hit = any(kw in fn_norm or kw in qn_norm for kw in keywords)
+            # Signal 3: the symbol lives in a workflow-specific module/path.
+            path_hit = False
+            if not name_hit and path_markers:
+                file_lower = sym.file.lower()
+                path_hit = any(m in file_lower for m in path_markers)
+            if not (name_hit or path_hit):
+                continue
+            if sym.qualified_name in seen:
+                continue
+            seen.add(sym.qualified_name)
+            matched.append(sym.qualified_name)
+            if name_hit:
+                matched_by_name += 1
+            else:
+                matched_by_path += 1
         entry_points[wf_id] = matched
+        logger.info(
+            "[_build_callgraph] client=%s wf=%s entry_points=%d (name=%d path=%d)",
+            client_name, wf_id, len(matched), matched_by_name, matched_by_path,
+        )
 
     cg = CallGraph(
         nodes=sorted(nodes_set),

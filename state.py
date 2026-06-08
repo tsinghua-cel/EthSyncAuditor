@@ -192,6 +192,7 @@ class GlobalState(TypedDict, total=False):
 
     verified_b_diffs: Annotated[list[dict], _merge_lists]
     rejected_b_diffs: Annotated[list[dict], _merge_lists]
+    unverified_b_diffs: Annotated[list[dict], _merge_lists]
     reclassified_to_a: Annotated[list[dict], _merge_lists]
     verification_evidence: Annotated[dict[str, list], _merge_dicts]
 

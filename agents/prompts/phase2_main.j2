@@ -52,13 +52,24 @@ For each B-class diff, provide ALL fields:
   deviating client.
 - `severity`: CRITICAL / MAJOR / MINOR
 - `security_note`: How this divergence could be exploited
+- **Two-sided evidence requirement**: You may only assert an asymmetry (e.g.
+  "only Lighthouse does X") if you can point to evidence for BOTH sides — where
+  the deviating client does X AND where the majority does Y. If you only have
+  evidence for one side, do NOT claim the others lack it; describe it as an
+  unconfirmed lead instead of a B-class diff.
 
 ### Step 3.5 — Identify C-Class Diffs (Consensus-Impacting Vulnerabilities)
 
-Beyond cross-client divergences, actively search for **vulnerabilities that could break
-consensus** — bugs or weaknesses present in individual clients (or shared across clients)
-that an adversary could exploit. Report these as B-class diffs with severity CRITICAL and
-a `security_note` prefixed with `[CONSENSUS VULN]`.
+Beyond cross-client divergences, you MAY report **vulnerabilities that could
+break consensus** — but only when the LSG evidence actually shows the defect.
+This is evidence-gated, not a quota: reporting zero consensus vulnerabilities
+for a workflow is a perfectly valid and common outcome. When you do find one,
+report it as a B-class diff with severity CRITICAL and a `security_note`
+prefixed with `[CONSENSUS VULN]`.
+
+**Do NOT report as a vulnerability:** defensive code (nil/bounds/validation
+guards), stricter-than-spec checks, operator-configuration or startup-only
+behavior, or anything you cannot tie to a concrete attacker-controlled trigger.
 
 **Vulnerability Patterns to Look For:**
 
@@ -75,6 +86,19 @@ a `security_note` prefixed with `[CONSENSUS VULN]`.
    - Empty slots: Are skipped slots handled consistently in slot processing and attestation?
    - Reorg depth: Is there a maximum reorg depth? What if a reorg crosses a finalized checkpoint?
    - Genesis/anchor block: Are special cases for slot 0 / the anchor block handled?
+
+   **Epoch-boundary precision (avoid category errors here):** `process_slots`
+   advances slot-by-slot; per-slot work (`process_slot`) is distinct from the
+   **epoch-transition** work that runs only when crossing an epoch boundary
+   (`process_epoch`: justification & finalization updates, `process_rewards_and_penalties`,
+   inactivity-leak scoring, registry/effective-balance updates, RANDAO mix,
+   slashings, committee/shuffling cache rollover). Do NOT confuse these with
+   **per-block** functions such as `process_sync_aggregate`, `process_attestation`,
+   or `process_block` — those run for every block regardless of epoch boundary,
+   and treating a per-block reward computation as an epoch-boundary cost is a
+   category error. When flagging an epoch-boundary divergence, name the exact
+   function and state whether it runs per-slot, per-block, or per-epoch, and
+   cite the controlling condition (e.g. `(slot + 1) % SLOTS_PER_EPOCH == 0`).
 
 4. **Specification Deviation**: Does any client deviate from the eth2 spec in a way that
    could cause it to accept blocks that other clients reject (or vice versa)?
@@ -108,7 +132,12 @@ Before reporting a B-class diff, verify:
 
 #### Severity Criteria
 
-**CRITICAL** — Consensus split, finality failure, or mass slashing risk
+**CRITICAL** — Consensus split, finality failure, or mass slashing risk. A
+CRITICAL rating REQUIRES a **remotely reachable, attacker-controlled** trigger
+(e.g. a crafted gossip message or peer response) whose effect reaches
+fork-choice, finality, or slashing. Issues triggered only by operator
+configuration, a trusted checkpoint source, or local startup are NOT CRITICAL
+— rate them MINOR/INFO at most.
 **MAJOR** — Exploitable asymmetry (peer penalty, timeout, unique state/guard)
 **MINOR** — Architectural difference with limited direct security impact
 

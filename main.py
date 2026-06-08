@@ -33,6 +33,7 @@ from file_io.writer import (
     write_diff_report,
     write_diff_report_json,
     write_false_positives_report,
+    write_unverified_report,
 )
 from graph import compile_graph, configure_graph, make_initial_state
 
@@ -256,6 +257,7 @@ def main() -> None:
         write_diff_report(final_state)
         write_diff_report_json(final_state)
         write_false_positives_report(final_state)
+        write_unverified_report(final_state)
 
     save_checkpoint(
         final_state,

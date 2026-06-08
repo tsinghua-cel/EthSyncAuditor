@@ -206,12 +206,27 @@ Do NOT copy or force-fit skeleton examples from the LSG Spec.
 
 ### 🔍 CONSENSUS VULNERABILITY ANALYSIS
 
-Beyond extracting the normal state machine, you MUST actively hunt for **consensus-impacting
-vulnerabilities** in {{ client_name }}'s {{ workflow_id }} implementation. These are NOT
-cross-client differences — they are **bugs or weaknesses in THIS client** that could cause
-consensus failures, chain splits, or safety violations regardless of what other clients do.
+In addition to the normal state machine, you MAY report **consensus-impacting
+vulnerabilities** you find in {{ client_name }}'s {{ workflow_id }}
+implementation — bugs or weaknesses in THIS client that could cause consensus
+failures, chain splits, or safety violations regardless of other clients.
 
-**Vulnerability Categories to Investigate:**
+**This is strictly evidence-gated. Do NOT go looking for trouble:**
+- Only report a vulnerability when the **actual code you have read** clearly
+  shows the defect. It is correct and expected to report ZERO vulnerabilities
+  for a workflow when the code does not show one.
+- Defensive code (nil checks, bounds checks, validation guards) and
+  stricter-than-spec checks are NOT vulnerabilities — do not report them.
+- A normal container insert, an ordinary RPC wrapper, or an API routing
+  function is NOT evidence of OOM / race / bypass. Do not extrapolate.
+- For every reported vulnerability you MUST be able to state a concrete
+  trigger chain: **attacker-controlled input → specific code path
+  (file:function:line) → consensus impact**. If you cannot identify a
+  remotely-reachable, attacker-controlled trigger, do NOT report it as a
+  CRITICAL consensus vulnerability.
+
+Use the categories below only as **investigative questions** to guide your
+reading of the source — not as a checklist to fill in:
 
 1. **Missing or Insufficient Validation**
    - Is signature verification (BLS) skipped or deferred in any code path?
@@ -260,13 +275,15 @@ consensus failures, chain splits, or safety violations regardless of what other 
    - Can a checkpoint state be loaded from a corrupted or truncated DB entry?
    - Are justified/finalized checkpoints persisted atomically with the blocks they reference?
 
-**How to Model Vulnerabilities in LSG:**
-- Add **error/vulnerability states** with prefix `<workflow>.vuln_*` (e.g., `initial.vuln_race_import`)
-- Use descriptive guards like `RaceConditionOnForkChoice`, `MissingBLSVerification`,
-  `UnboundedMemoryAllocation`, `TocTouValidationGap`
-- Use descriptive actions like `ExploitConcurrentImport`, `TriggerOOM`, `BypassValidation`
-- Set the transition's `evidence` to the exact file/function/line where the vulnerability exists
-- In the state's `label`, prefix with `[VULN]` to distinguish from normal states
+**How to Model a Vulnerability in the LSG (only when code-backed):**
+- Add an **error/vulnerability state** with prefix `<workflow>.vuln_*`
+  (e.g., `initial.vuln_race_import`), and prefix the state `label` with `[VULN]`.
+- Name the guard/action after the **actual symbols in the code**, not from any
+  example list. Do not invent generic names like `TriggerOOM` unless the code
+  literally supports that behavior.
+- The transition's `evidence` (file, function, line range) is **mandatory** and
+  must point at the exact code where the defect exists. A vulnerability state
+  without precise evidence must NOT be emitted.
 
 {% if code_snippets %}
 ## Source Code Context ({{ code_snippets | length }} snippets from {{ client_name }})

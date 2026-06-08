@@ -978,3 +978,55 @@ def write_false_positives_report(state: dict[str, Any]) -> Path | None:
     )
     return path
 
+
+def write_unverified_report(state: dict[str, Any]) -> Path | None:
+    """Write B-class diffs that could not be verified to a separate file.
+
+    These are **not** false positives: the evidence gate could neither
+    confirm nor refute them (missing verdict, unresolved/empty evidence, or
+    no code retrieved). They are excluded from the main report but retained
+    as leads for manual review. Returns ``None`` when there are none.
+    """
+    unverified = state.get("unverified_b_diffs", [])
+    if not unverified:
+        return None
+
+    config.OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+    path = config.OUTPUT_PATH / "Audit_Unverified_Leads.md"
+
+    lines: list[str] = [
+        "# EthAuditor — Unverified Leads (Needs Manual Review)",
+        "",
+        f"**Generated at**: {datetime.now(timezone.utc).isoformat()}",
+        "",
+        "These B-class diffs could **not** be verified against source code "
+        "during Phase 3. Unlike the false-positives file, these are **not** "
+        "proven wrong — the evidence gate simply could not resolve concrete "
+        "code evidence to confirm or refute them. Treat them as candidate "
+        "leads requiring manual investigation, **not** as audit conclusions.",
+        "",
+        f"## Unverified Diffs ({len(unverified)})",
+        "",
+    ]
+    for i, diff in enumerate(unverified, 1):
+        lines.append(f"### U-{i}: {diff.get('workflow_id', '?')} / "
+                     f"{diff.get('state_id', '?')}")
+        lines.append("")
+        lines.append(f"- **Guard**: `{diff.get('transition_guard', '?')}`")
+        lines.append(f"- **Original Severity**: {diff.get('severity', '?')}")
+        deviating = diff.get("deviating_clients", [])
+        if deviating:
+            lines.append(f"- **Deviating client(s)**: {', '.join(deviating)}")
+        lines.append(f"- **Description**: {diff.get('description', '')}")
+        reason = diff.get("unverified_reason", "")
+        if reason:
+            lines.append(f"- **Why unverified**: {reason}")
+        lines.append("")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    logger.info("[write_unverified_report] → %s (unverified=%d)",
+                path, len(unverified))
+    return path
+

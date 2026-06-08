@@ -1,0 +1,33 @@
+{# Phase 1 query-planning prompt — small in/out, NO code #}
+You are planning local code searches to expand the Guard/Action vocabulary for
+the **{{ client_name }}** Ethereum consensus client ({{ language }}).
+
+A **Guard** is a branch predicate / precondition (e.g. "is the block already
+known?", "is the execution payload valid?"). An **Action** is a side-effect
+(state mutation, network send, signing, persistence, peer penalty).
+
+## Current vocabulary (names only)
+
+Guards ({{ guard_names | length }}): {{ guard_names | join(', ') }}
+Actions ({{ action_names | length }}): {{ action_names | join(', ') }}
+
+## Workflows to cover
+
+{% for wf in workflows %}- **{{ wf.id }}**: {{ wf.desc }}
+{% endfor %}
+
+## Task
+
+Propose concise code-search queries that are most likely to surface Guards and
+Actions **missing** from the vocabulary above. Aim for the gaps — do not
+re-query concepts already well covered by existing names.
+
+Guidance:
+- Each query is a short phrase or symbol (e.g. "blob sidecar availability
+  check", "peer penalty on invalid batch", "optimistic import threshold").
+- Tag each query with the `workflow_id` it targets (one of the ids above).
+- Prefer specific, discriminating terms over generic ones.
+- Produce 2-3 queries per workflow, at most {{ max_queries }} queries total.
+
+Return a `SearchPlan` with the `queries` list. Output only the plan — no code,
+no explanations.

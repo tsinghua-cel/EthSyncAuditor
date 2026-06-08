@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from jinja2 import Template
 from pydantic import BaseModel, Field
@@ -39,6 +39,7 @@ def _load_template(path: Path) -> Template:
 
 class CodeEvidence(BaseModel):
     """A single code snippet found during verification."""
+    id: str = ""
     file: str = ""
     function: str = ""
     lines: list[int] = Field(default_factory=list)
@@ -61,12 +62,25 @@ class VerifySubResult(BaseModel):
 
 
 class VerifyVerdict(BaseModel):
-    """Verdict for a single B-class diff."""
+    """Verdict for a single B-class diff.
+
+    ``cited_evidence_ids`` MUST reference the ``id`` of real code-evidence
+    snippets shown to the judge. A CONFIRMED / DOWNGRADED verdict is only
+    accepted if at least one cited id resolves to real, preprocessing-backed
+    code evidence; otherwise the diff is demoted to INSUFFICIENT_EVIDENCE.
+    This prevents "confirmed with empty/hallucinated evidence" outcomes.
+    """
     diff_id: str = ""
-    verdict: str = "CONFIRMED"  # CONFIRMED | REJECTED | DOWNGRADED | RECLASSIFIED
+    # No default verdict: an unset/unknown verdict is treated as
+    # INSUFFICIENT_EVIDENCE downstream, never silently CONFIRMED.
+    verdict: Literal[
+        "CONFIRMED", "REJECTED", "DOWNGRADED",
+        "RECLASSIFIED", "INSUFFICIENT_EVIDENCE",
+    ] = "INSUFFICIENT_EVIDENCE"
     original_severity: str = ""
     new_severity: str = ""
     confidence: float = 0.8
+    cited_evidence_ids: list[str] = Field(default_factory=list)
     evidence_summary: str = ""
     updated_description: str = ""
     updated_security_note: str = ""
@@ -211,6 +225,7 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
             diff_id = f"B-{i + 1}"
             queries = _build_search_queries(diff)
             code_snippets: list[dict] = []
+            seen_snips: set[tuple] = set()
 
             if search_available and not is_mock:
                 for query in queries:
@@ -222,13 +237,26 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
                             top_k=VERIFY_SEARCH_TOP_K,
                         )
                         for r in results:
+                            file_path = r.metadata.get("file_path", "")
+                            lines = [
+                                r.metadata.get("start_line", 0),
+                                r.metadata.get("end_line", 0),
+                            ]
+                            # Dedupe by (file, line range) to keep the
+                            # evidence pool small and stable.
+                            key = (file_path, lines[0], lines[1])
+                            if key in seen_snips:
+                                continue
+                            seen_snips.add(key)
+                            # Stable, machine-verifiable evidence id. The
+                            # judge must cite these ids; only ids that resolve
+                            # back to this real pool are accepted as evidence.
+                            ev_id = f"{client_name}::{diff_id}::{len(code_snippets) + 1}"
                             code_snippets.append({
-                                "file": r.metadata.get("file_path", ""),
+                                "id": ev_id,
+                                "file": file_path,
                                 "function": r.metadata.get("function_name", ""),
-                                "lines": [
-                                    r.metadata.get("start_line", 0),
-                                    r.metadata.get("end_line", 0),
-                                ],
+                                "lines": lines,
                                 "snippet": r.content[:500] if r.content else "",
                                 "query": query,
                                 "score": r.score,
@@ -263,7 +291,18 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
                     label=f"phase3_verify_sub/{client_name}/{current_wf}",
                     callbacks=callbacks,
                 )
-                findings = [f.model_dump() for f in result.findings]
+                # Ground every finding's evidence to the REAL search pool
+                # (with stable ids), discarding any LLM-invented snippets.
+                # The judge and the evidence gate only ever see real,
+                # preprocessing-backed file/line metadata.
+                pool_by_diff = {
+                    ev["diff_id"]: ev["code_snippets"] for ev in all_evidence
+                }
+                findings = []
+                for f in result.findings:
+                    fd = f.model_dump()
+                    fd["code_evidence"] = pool_by_diff.get(fd.get("diff_id", ""), [])
+                    findings.append(fd)
                 return {"verification_evidence": {client_name: findings}}
             except Exception:
                 logger.error(
@@ -290,6 +329,66 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
         return {"verification_evidence": {client_name: mock_findings}}
 
     return _run
+
+
+# Evidence gate helpers
+
+
+def _build_evidence_index(
+    evidence_map: dict[str, list],
+) -> dict[str, dict[str, dict]]:
+    """Index real, preprocessing-backed code evidence by diff_id → ev_id → snippet.
+
+    Only snippets that carry a non-empty ``id`` and a real ``file`` are
+    indexed. These are the *only* citations the gate will accept, which is
+    what makes the "confirmed" verdict resistant to empty/hallucinated
+    evidence.
+    """
+    index: dict[str, dict[str, dict]] = {}
+    for client, findings in (evidence_map or {}).items():
+        if not isinstance(findings, list):
+            continue
+        for f in findings:
+            diff_id = f.get("diff_id", "")
+            if not diff_id:
+                continue
+            bucket = index.setdefault(diff_id, {})
+            for ev in f.get("code_evidence", []) or []:
+                ev_id = ev.get("id", "")
+                if ev_id and ev.get("file"):
+                    bucket[ev_id] = {**ev, "client": client}
+    return index
+
+
+def _resolve_cited_evidence(
+    diff_id: str,
+    cited_ids: list[str],
+    ev_index: dict[str, dict[str, dict]],
+) -> dict[str, dict]:
+    """Resolve cited evidence ids to a ``{client: Evidence}`` map.
+
+    Returns only ids that match real evidence for *diff_id*. An empty result
+    means the citation could not be validated (missing or hallucinated).
+    """
+    bucket = ev_index.get(diff_id, {})
+    resolved: dict[str, dict] = {}
+    for ev_id in cited_ids or []:
+        ev = bucket.get(ev_id)
+        if not ev:
+            continue
+        client = ev.get("client", "")
+        if client and client not in resolved:
+            resolved[client] = {
+                "file": ev.get("file", ""),
+                "function": ev.get("function", ""),
+                "lines": ev.get("lines", []),
+            }
+    return resolved
+
+
+def _diff_has_any_evidence(diff_id: str, ev_index: dict[str, dict[str, dict]]) -> bool:
+    """True if any real code evidence was collected for *diff_id*."""
+    return bool(ev_index.get(diff_id))
 
 
 # Verify Main Agent
@@ -333,7 +432,7 @@ def build_phase3_verify_main_agent(llm=None, callbacks=None):
                     label=f"phase3_verify_main/{current_wf}",
                     callbacks=callbacks,
                 )
-                return _apply_verdicts(b_diffs, result.verdicts, current_wf)
+                return _apply_verdicts(b_diffs, result.verdicts, evidence_map, current_wf)
             except Exception:
                 logger.error(
                     "LLM call failed for phase3_verify_main/%s",
@@ -356,18 +455,22 @@ def _deterministic_verify(
 ) -> dict[str, Any]:
     """Heuristic verification when no LLM is available.
 
-    Rules:
-    1. If ALL deviating clients have PRESENT finding → REJECTED
-       (the feature exists, just named/located differently).
-    2. If some deviating clients have DIFFERENT_LOCATION and none ABSENT
-       → RECLASSIFIED (naming/structural difference, not logic).
-    3. If some deviating clients have PARTIAL and none ABSENT
-       → DOWNGRADED (partially implemented → lower severity).
-    4. Otherwise (ABSENT in ≥1 deviating client) → CONFIRMED.
+    Conservative rules (a diff only reaches the main report as CONFIRMED /
+    DOWNGRADED when real code evidence backs it):
+    1. No deviating clients → INSUFFICIENT_EVIDENCE (cannot assess).
+    2. ALL deviating clients PRESENT → REJECTED (feature exists).
+    3. DIFFERENT_LOCATION (and none ABSENT) → RECLASSIFIED (naming/structural).
+    4. PARTIAL (and none ABSENT) with evidence → DOWNGRADED.
+    5. ABSENT in ≥1 deviating client AND real evidence was collected for the
+       relevant path → CONFIRMED.
+    6. Otherwise (no evidence at all) → INSUFFICIENT_EVIDENCE, never CONFIRMED.
     """
+    ev_index = _build_evidence_index(evidence_map)
+
     verified: list[dict] = []
     rejected: list[dict] = []
     reclassified: list[dict] = []
+    unverified: list[dict] = []
 
     # Index findings by (client, diff_id)
     findings_idx: dict[tuple[str, str], dict] = {}
@@ -381,9 +484,14 @@ def _deterministic_verify(
         diff_id = f"B-{i + 1}"
         deviating = diff.get("deviating_clients", [])
         severity = diff.get("severity", "MAJOR")
+        has_evidence = _diff_has_any_evidence(diff_id, ev_index)
 
         if not deviating:
-            verified.append({**diff, "verification_status": "CONFIRMED"})
+            unverified.append({
+                **diff,
+                "verification_status": "INSUFFICIENT_EVIDENCE",
+                "unverified_reason": "No deviating clients to assess.",
+            })
             continue
 
         # Gather findings for each deviating client
@@ -397,6 +505,11 @@ def _deterministic_verify(
         diff_loc_count = sum(1 for f in dev_findings if f == "DIFFERENT_LOCATION")
         absent_count = sum(1 for f in dev_findings if f == "ABSENT")
 
+        # Pull whatever real evidence exists for this diff (any client).
+        diff_evidence = _resolve_cited_evidence(
+            diff_id, list(ev_index.get(diff_id, {}).keys()), ev_index,
+        )
+
         if present_count > 0 and absent_count == 0:
             rejected.append({
                 **diff,
@@ -406,6 +519,7 @@ def _deterministic_verify(
                     f"'{diff.get('transition_guard', '?')}' is PRESENT in "
                     f"all deviating clients ({', '.join(deviating)})."
                 ),
+                "evidence": diff_evidence or diff.get("evidence", {}),
             })
         elif diff_loc_count > 0 and absent_count == 0:
             reclassified.append({
@@ -413,9 +527,19 @@ def _deterministic_verify(
                 "verification_status": "RECLASSIFIED",
                 "diff_type": "A",
                 "reclassify_reason": (
-                    f"Feature exists in deviating client(s) but in a "
-                    f"different module/location — naming/structural "
-                    f"difference, not a logic divergence."
+                    "Feature exists in deviating client(s) but in a "
+                    "different module/location — naming/structural "
+                    "difference, not a logic divergence."
+                ),
+            })
+        elif not has_evidence:
+            # No real code was retrieved → cannot confirm an absence/partial.
+            unverified.append({
+                **diff,
+                "verification_status": "INSUFFICIENT_EVIDENCE",
+                "unverified_reason": (
+                    "No code evidence was retrieved for the relevant path; "
+                    "the divergence could not be confirmed or refuted."
                 ),
             })
         elif partial_count > 0 and absent_count == 0:
@@ -427,40 +551,60 @@ def _deterministic_verify(
                 "verification_status": "DOWNGRADED",
                 "original_severity": severity,
                 "severity": new_sev,
+                "evidence": diff_evidence or diff.get("evidence", {}),
             })
         else:
-            verified.append({**diff, "verification_status": "CONFIRMED"})
+            verified.append({
+                **diff,
+                "verification_status": "CONFIRMED",
+                "evidence": diff_evidence or diff.get("evidence", {}),
+            })
 
     logger.info(
-        "[phase3_verify] wf=%s — verified=%d rejected=%d reclassified=%d",
-        current_wf, len(verified), len(rejected), len(reclassified),
+        "[phase3_verify] wf=%s — verified=%d rejected=%d reclassified=%d unverified=%d",
+        current_wf, len(verified), len(rejected), len(reclassified), len(unverified),
     )
 
     return {
         "verified_b_diffs": verified,
         "rejected_b_diffs": rejected,
         "reclassified_to_a": reclassified,
+        "unverified_b_diffs": unverified,
     }
 
 
 def _apply_verdicts(
     b_diffs: list[dict],
     verdicts: list[VerifyVerdict],
+    evidence_map: dict[str, list],
     current_wf: str,
 ) -> dict[str, Any]:
-    """Apply LLM-generated verdicts to the B-class diffs."""
+    """Apply LLM-generated verdicts to the B-class diffs.
+
+    Enforces the evidence gate: a CONFIRMED / DOWNGRADED verdict is only
+    accepted when it cites at least one evidence id that resolves to real,
+    preprocessing-backed code evidence. Verdicts that are missing, unknown,
+    INSUFFICIENT_EVIDENCE, or "confirmed" without resolvable evidence are
+    routed to ``unverified_b_diffs`` and excluded from the main report.
+    """
+    ev_index = _build_evidence_index(evidence_map)
     verdict_map: dict[str, VerifyVerdict] = {v.diff_id: v for v in verdicts}
 
     verified: list[dict] = []
     rejected: list[dict] = []
     reclassified: list[dict] = []
+    unverified: list[dict] = []
 
     for i, diff in enumerate(b_diffs):
         diff_id = f"B-{i + 1}"
         v = verdict_map.get(diff_id)
 
         if v is None:
-            verified.append({**diff, "verification_status": "CONFIRMED"})
+            unverified.append({
+                **diff,
+                "verification_status": "INSUFFICIENT_EVIDENCE",
+                "unverified_reason": "No verdict was issued for this diff.",
+            })
             continue
 
         if v.verdict == "REJECTED":
@@ -479,35 +623,58 @@ def _apply_verdicts(
                 "verification_confidence": v.confidence,
                 "description": v.updated_description or diff.get("description", ""),
             })
-        elif v.verdict == "DOWNGRADED":
-            verified.append({
+        elif v.verdict in ("CONFIRMED", "DOWNGRADED"):
+            resolved = _resolve_cited_evidence(diff_id, v.cited_evidence_ids, ev_index)
+            if not resolved:
+                # Evidence gate: a confirmation without resolvable, real code
+                # evidence is demoted rather than published as a finding.
+                unverified.append({
+                    **diff,
+                    "verification_status": "INSUFFICIENT_EVIDENCE",
+                    "unverified_reason": (
+                        f"Verdict was {v.verdict} but cited evidence ids "
+                        f"{v.cited_evidence_ids or '[]'} did not resolve to any "
+                        f"real code evidence."
+                    ),
+                    "verification_confidence": v.confidence,
+                    "evidence_summary": v.evidence_summary,
+                })
+                continue
+            entry = {
                 **diff,
-                "verification_status": "DOWNGRADED",
-                "original_severity": diff.get("severity", ""),
-                "severity": v.new_severity or diff.get("severity", ""),
-                "description": v.updated_description or diff.get("description", ""),
-                "security_note": v.updated_security_note or diff.get("security_note", ""),
+                "verification_status": v.verdict,
+                "evidence": resolved,
+                "verification_confidence": v.confidence,
+            }
+            if v.verdict == "DOWNGRADED":
+                entry["original_severity"] = diff.get("severity", "")
+                entry["severity"] = v.new_severity or diff.get("severity", "")
+            if v.updated_description:
+                entry["description"] = v.updated_description
+            if v.updated_security_note:
+                entry["security_note"] = v.updated_security_note
+            if v.evidence_summary:
+                entry["evidence_summary"] = v.evidence_summary
+            verified.append(entry)
+        else:  # INSUFFICIENT_EVIDENCE or any unknown value
+            unverified.append({
+                **diff,
+                "verification_status": "INSUFFICIENT_EVIDENCE",
+                "unverified_reason": v.evidence_summary or (
+                    "Insufficient evidence to confirm or refute the divergence."
+                ),
                 "verification_confidence": v.confidence,
             })
-        else:  # CONFIRMED
-            updated = {**diff, "verification_status": "CONFIRMED"}
-            if v.updated_description:
-                updated["description"] = v.updated_description
-            if v.updated_security_note:
-                updated["security_note"] = v.updated_security_note
-            if v.evidence_summary:
-                updated["evidence_summary"] = v.evidence_summary
-            updated["verification_confidence"] = v.confidence
-            verified.append(updated)
 
     logger.info(
-        "[phase3_verify] wf=%s — verified=%d rejected=%d reclassified=%d",
-        current_wf, len(verified), len(rejected), len(reclassified),
+        "[phase3_verify] wf=%s — verified=%d rejected=%d reclassified=%d unverified=%d",
+        current_wf, len(verified), len(rejected), len(reclassified), len(unverified),
     )
 
     return {
         "verified_b_diffs": verified,
         "rejected_b_diffs": rejected,
         "reclassified_to_a": reclassified,
+        "unverified_b_diffs": unverified,
     }
 
