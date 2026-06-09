@@ -28,11 +28,12 @@ Workflow: **{{ workflow_id }}** | Iteration: {{ iteration }}.
 ## Previous Workflow Version
 
 Below is the {{ workflow_id }} workflow from the {% if iteration > 1 %}previous iteration{% else %}merged baseline{% endif %}.
-**EXPAND and CORRECT** it:
-- **ADD** missing states and transitions you discover in the source code.
-- **FIX** any incorrect guards, actions, or next_state references.
-- **DO NOT** discard existing states/transitions unless they are demonstrably wrong.
-- **ADD evidence** (file, function, line range) for every transition.
+**EXPAND and CORRECT** it based on the code snippets below:
+- **ADD** missing states and transitions you find in the snippets.
+- **FIX** incorrect guards, actions, or next_state references where the snippets show different code.
+- **DO NOT** discard existing states/transitions unless a snippet clearly contradicts them.
+- **UPDATE evidence** fields to point at real snippet files — clear any evidence that points to a
+  file NOT in the snippet list below.
 
 ```yaml
 {{ previous_wf_yaml }}
@@ -202,7 +203,9 @@ Do NOT copy or force-fit skeleton examples from the LSG Spec.
 - **Derive states from code**: Read actual control-flow, event loops, match arms, switch cases.
 - **Name states descriptively**: `<workflow>.<phase>` where `<phase>` reflects what the code does.
 - **Completeness over conformity**: If {{ client_name }} has a unique step, include it.
-- **Evidence is mandatory**: Every transition MUST have evidence (file, function, line range).
+- **Evidence**: Set `evidence.file` and `evidence.function` **only to values shown in the
+  snippets above**. If a transition is not directly visible in a snippet, leave evidence null.
+  Do NOT invent plausible-looking file paths — null is correct, invented paths are wrong.
 
 ### 🔍 CONSENSUS VULNERABILITY ANALYSIS
 
@@ -286,19 +289,36 @@ reading of the source — not as a checklist to fill in:
   without precise evidence must NOT be emitted.
 
 {% if code_snippets %}
-## Source Code Context ({{ code_snippets | length }} snippets from {{ client_name }})
+## Source Code Snippets (retrieved from {{ client_name }}, {{ code_snippets | length }} snippets)
 
-The following code snippets were retrieved from {{ client_name }}'s source code for the
-**{{ workflow_id }}** workflow. Use them to derive your state machine — do NOT invent
-states or transitions that are not supported by this code or other code you know about.
+These snippets were retrieved locally from {{ client_name }}'s real source code.
+Each has a stable **evidence id**. You MUST derive your state machine from these
+snippets — not from spec descriptions, not from training memory.
+
+**Evidence rules (hard constraints):**
+1. Every transition MUST set `evidence.file` to a **file shown in one of the
+   snippets below**. The full set of valid files is:
+{% for snippet in code_snippets %}   - `{{ snippet.file }}`
+{% endfor %}
+2. `evidence.function` MUST be the **actual function name** shown in that snippet.
+3. `evidence.lines` MUST be within the line range `[{{ "snippet.start_line" }}, {{ "snippet.end_line" }}]`
+   of the chosen snippet (or any sub-range you observe inside it).
+4. If a transition is not visible in any snippet, **leave evidence null** — do
+   NOT invent a plausible-looking path. A null evidence is honest; a hallucinated
+   path destroys the value of the whole LSG.
+5. Do NOT cite files that are NOT in the list above, even if you know they exist.
 
 {% for snippet in code_snippets %}
-### {{ snippet.function }} — `{{ snippet.file }}` L{{ snippet.lines }}
+### [{{ snippet.id }}] `{{ snippet.file }}` :: `{{ snippet.function }}` L{{ snippet.start_line }}–{{ snippet.end_line }}
 ```{{ language }}
 {{ snippet.code }}
 ```
 
 {% endfor %}
+{% else %}
+_No code snippets retrieved for this client/workflow. Build the state machine
+from the vocabulary above and prior iteration output if available. Set all
+evidence fields to null — do NOT invent file paths._
 {% endif %}
 
 {% if a_class_feedback %}
