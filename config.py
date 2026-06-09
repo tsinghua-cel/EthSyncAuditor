@@ -167,7 +167,7 @@ EMBEDDING_MODELS: list[str] = [
 # LLM provider & model
 LLM_PROVIDER: str = "anthropic"          # "anthropic" | "gemini" | "deepseek"
 LLM_MODEL: str = "claude-opus-4-6"
-GEMINI_MODEL: str = "gemini-2.5-flash"
+GEMINI_MODEL: str = "gemini-3.5-flash"
 DEEPSEEK_MODEL: str = "deepseek-v4-pro"
 
 # API base URLs (empty = provider default; CLI / env vars override)
