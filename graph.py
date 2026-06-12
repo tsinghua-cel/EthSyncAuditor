@@ -82,6 +82,8 @@ def make_initial_state() -> dict[str, Any]:
         "unverified_b_diffs": [],
         "reclassified_to_a": [],
         "verification_evidence": {},
+        "scenario_coverages": {},
+        "scenario_triggered_reiter": [],
     }
 
 
@@ -414,6 +416,103 @@ def phase2_wf_force_stop_node(state: GlobalState) -> dict[str, Any]:
     }
 
 
+# ── Phase 2.5: Scenario Scan ─────────────────────────────────────────────────
+
+
+def phase2_scenario_fanout(state: GlobalState) -> list[Send]:
+    """Fan out to one scenario-scan sub-agent per client."""
+    return [
+        Send("phase2_scenario_sub", {**state, "_client_name": client})
+        for client in CLIENT_NAMES
+    ]
+
+
+def phase2_scenario_sub_node(state: GlobalState) -> dict[str, Any]:
+    from agents.phase2_scenario_agent import build_phase2_scenario_agent
+
+    client_name = state.get("_client_name", "unknown")
+    current_wf = state.get("current_workflow", "unknown")
+    logger.info("[phase2_scenario_sub] client=%s wf=%s", client_name, current_wf)
+
+    cbs = _make_callbacks(2, 0, f"phase2_scenario_{client_name}_{current_wf}")
+    return build_phase2_scenario_agent(
+        client_name, llm=_get_llm(), callbacks=cbs,
+    )(state)
+
+
+def phase2_scenario_collect_node(state: GlobalState) -> dict[str, Any]:
+    """Collect scenario scan results and decide whether to re-iterate Phase 2."""
+    from agents.phase2_scenario_agent import get_scenario_hints_for_reiter
+
+    wf = state.get("current_workflow", "")
+    coverages = state.get("scenario_coverages", {})
+    triggered = set(state.get("scenario_triggered_reiter", []))
+
+    # Count per-scenario coverage across clients
+    from config import SCENARIOS
+    relevant = [s for s in SCENARIOS if wf in s.relevant_workflows]
+    summary: list[str] = []
+    for sc in relevant:
+        covered_clients = [
+            cov["client"]
+            for key, cov in coverages.items()
+            if cov.get("scenario_id") == sc.id
+            and cov.get("workflow_id") == wf
+            and cov.get("covered")
+        ]
+        summary.append(
+            f"  {sc.id}: covered_by={covered_clients or 'NONE'}"
+        )
+    if summary:
+        logger.info("[phase2_scenario_collect] wf=%s\n%s", wf, "\n".join(summary))
+
+    # Build sparsity-style hints for uncovered scenarios
+    hints = get_scenario_hints_for_reiter(state, wf)
+    new_reiter_keys = [
+        f"{wf}::{h['scenario_id']}"
+        for h in hints
+        if f"{wf}::{h['scenario_id']}" not in triggered
+    ]
+
+    if hints and new_reiter_keys:
+        logger.info(
+            "[phase2_scenario_collect] wf=%s — scenario gaps for %d scenarios, "
+            "triggering re-iteration",
+            wf, len({h["scenario_id"] for h in hints}),
+        )
+        return {
+            "sparsity_hints": hints,
+            "scenario_triggered_reiter": new_reiter_keys,
+        }
+
+    return {}
+
+
+def _route_after_scenario_collect(state: GlobalState) -> str:
+    """After scenario scan: re-iterate Phase 2 if NEW gaps found, else proceed."""
+    wf = state.get("current_workflow", "")
+    triggered = set(state.get("scenario_triggered_reiter", []))
+    hints = state.get("sparsity_hints", [])
+
+    # Only look at scenario-type hints (they have a 'scenario_id' field) for
+    # the current workflow. Regular sparsity hints from Phase 2 don't have
+    # 'scenario_id' and should not trigger a re-iteration here.
+    wf_scenario_hints = [
+        h for h in hints
+        if h.get("workflow_id") == wf and h.get("scenario_id")
+    ]
+
+    # A re-iteration is warranted only if there are un-triggered scenario gaps
+    new_gaps = any(
+        f"{wf}::{h['scenario_id']}" not in triggered
+        for h in wf_scenario_hints
+    )
+    if new_gaps:
+        logger.info("[route_scenario] wf=%s → re-enter phase2_fanout", wf)
+        return "phase2_fanout"
+    return "verify_or_scheduler"
+
+
 def phase3_verify_fanout(state: GlobalState) -> list[Send]:
     diff_report = state.get("diff_report", {})
     b_diffs = diff_report.get("b_class_diffs", [])
@@ -539,6 +638,9 @@ def build_graph() -> StateGraph:
     g.add_node("phase2_enter_b_class_focus", phase2_enter_b_class_focus_node)
     g.add_node("phase2_wf_converged", phase2_wf_converged_node)
     g.add_node("phase2_wf_force_stop", phase2_wf_force_stop_node)
+    g.add_node("phase2_scenario_fanout", lambda _s: {})
+    g.add_node("phase2_scenario_sub", phase2_scenario_sub_node)
+    g.add_node("phase2_scenario_collect", phase2_scenario_collect_node)
     g.add_node("phase3_verify_fanout", lambda _s: {})
     g.add_node("phase3_verify_sub", phase3_verify_sub_node)
     g.add_node("phase3_verify_main", phase3_verify_main_node)
@@ -584,13 +686,24 @@ def build_graph() -> StateGraph:
         {"phase2_fanout": "phase2_fanout"},
     )
     for end_node in ("phase2_wf_converged", "phase2_wf_force_stop"):
-        g.add_conditional_edges(
-            end_node, _route_to_verify_or_scheduler,
-            {
-                "phase3_verify_fanout": "phase3_verify_fanout",
-                "workflow_scheduler": "workflow_scheduler",
-            },
-        )
+        g.add_edge(end_node, "phase2_scenario_fanout")
+
+    g.add_conditional_edges("phase2_scenario_fanout", phase2_scenario_fanout,
+                            ["phase2_scenario_sub"])
+    g.add_edge("phase2_scenario_sub", "phase2_scenario_collect")
+    g.add_conditional_edges(
+        "phase2_scenario_collect", _route_after_scenario_collect,
+        {"phase2_fanout": "phase2_fanout", "verify_or_scheduler": "verify_or_scheduler"},
+    )
+    # Proxy node so we can use it as a conditional target
+    g.add_node("verify_or_scheduler", lambda s: {})
+    g.add_conditional_edges(
+        "verify_or_scheduler", _route_to_verify_or_scheduler,
+        {
+            "phase3_verify_fanout": "phase3_verify_fanout",
+            "workflow_scheduler": "workflow_scheduler",
+        },
+    )
 
     g.add_conditional_edges("phase3_verify_fanout", phase3_verify_fanout,
                             ["phase3_verify_sub"])

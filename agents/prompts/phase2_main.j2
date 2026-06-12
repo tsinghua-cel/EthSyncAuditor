@@ -145,6 +145,27 @@ configuration, a trusted checkpoint source, or local startup are NOT CRITICAL
 
 `logic_diff_rate = B-class count / total comparison items`
 
+{% if scenario_coverages %}
+### Step 3.5 — Scenario Coverage Comparison
+
+The following fault scenarios have been scanned against each client's LSG.
+Use this information to:
+- Elevate B-class diffs that correspond to a scenario where some clients
+  lack coverage (add the scenario_id to the `security_note`).
+- Add NEW B-class diffs for scenarios where coverage is clearly asymmetric
+  (some clients handle it, others don't) but no B-class diff was found yet.
+- Do NOT add a B-class diff if all clients are equally covered or uncovered.
+
+{% for scenario_id, coverages in scenario_coverages.items() %}
+#### Scenario: `{{ scenario_id }}`
+| Client | Covered | State(s) | Guard(s) | Notes |
+|---|---|---|---|---|
+{% for c in coverages %}
+| {{ c.client }} | {{ '✅' if c.covered else '❌' }} | {{ c.state_ids | join(', ') or '—' }} | {{ c.transition_guards | join(', ') or '—' }} | {{ c.notes or '—' }} |
+{% endfor %}
+{% endfor %}
+{% endif %}
+
 ### Output
 
 - `a_class_diffs`: A-class list with vocabulary alignment directives

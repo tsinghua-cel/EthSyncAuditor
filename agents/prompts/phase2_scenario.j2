@@ -1,0 +1,54 @@
+{# Phase 2.5 Scenario Scan — does the current LSG represent this fault scenario? #}
+You are auditing the **{{ client_name }}** Ethereum consensus client.
+
+## Fault Scenario: {{ scenario_name }} (`{{ scenario_id }}`)
+
+- **Trigger**: {{ scenario_trigger }}
+- **Risk if unhandled**: {{ scenario_risk }}
+
+## Current LSG for `{{ workflow_id }}`
+
+```
+{{ workflow_lsg }}
+```
+
+## Relevant Code Snippets (retrieved from {{ client_name }})
+
+{% if snippets %}
+{% for s in snippets %}
+### [{{ s.id }}] `{{ s.file }}` :: `{{ s.function }}` L{{ s.start_line }}–{{ s.end_line }}
+```
+{{ s.snippet }}
+```
+{% endfor %}
+{% else %}
+_No code snippets found for this scenario in {{ client_name }}._
+{% endif %}
+
+## Task
+
+1. **Does the current LSG represent how {{ client_name }} handles the scenario
+   `{{ scenario_id }}`?**
+
+   - Look for: detection guards, recovery/response actions, error/fallback states.
+   - A scenario is **covered** if the LSG has at least one state+transition that
+     explicitly handles this fault condition.
+
+2. If **covered**, identify:
+   - `state_ids`: which LSG state(s) contain the handling
+   - `transition_guards`: the guard condition(s) that trigger it
+   - `evidence_file` / `evidence_function` / `evidence_lines`: from a snippet above
+     that shows the handling (cite ONLY files shown in the snippets, not invented paths)
+   - `notes`: one sentence describing how the client handles it
+
+3. If **NOT covered**, propose:
+   - `suggested_transitions`: list of dicts `{guard, actions, next_state, rationale}`
+     describing the state/transition(s) that should be added to the LSG.
+   - `notes`: what's missing and why it matters.
+
+4. If **no code snippets were provided or all snippets are off-topic**, set
+   `covered=false`, leave `suggested_transitions` empty, and note "no evidence
+   found" — do NOT guess or invent.
+
+Return a `_ScenarioCoverageResult` with `client_name="{{ client_name }}"` and
+`scenario_id="{{ scenario_id }}"`.

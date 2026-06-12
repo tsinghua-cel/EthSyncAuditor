@@ -326,12 +326,21 @@ def build_phase2_main_agent(llm=None, callbacks=None):
         # ── LLM path ───────────────────────────────────────────────────
         if llm is not None:
             template = _load_prompt_template()
+            # Build scenario coverage summary for this workflow to include in prompt
+            scenario_coverages = state.get("scenario_coverages", {})
+            wf_scenario_cov: dict[str, list] = {}  # scenario_id → list of per-client coverage dicts
+            for key, cov in scenario_coverages.items():
+                if cov.get("workflow_id") == current_wf:
+                    sid = cov.get("scenario_id", "")
+                    wf_scenario_cov.setdefault(sid, []).append(cov)
+
             _prompt = template.render(
                 client_lsgs=client_lsgs,
                 iteration=iteration,
                 current_workflow=current_wf,
                 guard_names=[g.get("name", "?") for g in guards],
                 action_names=[a.get("name", "?") for a in actions],
+                scenario_coverages=wf_scenario_cov,
             )
             try:
                 chain = llm.with_structured_output(DiffReport)

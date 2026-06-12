@@ -27,6 +27,9 @@ class Transition(BaseModel):
     actions: list[str] = Field(default_factory=list)
     next_state: str
     evidence: Evidence | None = None
+    # Scenario IDs for which this transition is the handling point.
+    # Populated by Phase 2.5 scenario scan; empty = no scenario annotation.
+    scenario_ids: list[str] = Field(default_factory=list)
 
 
 class LSGState(BaseModel):
@@ -96,6 +99,25 @@ class PreprocessStatus(BaseModel):
     def all_ready(self) -> bool:
         return (self.symbols_ready and self.callgraph_ready
                 and self.vector_index_ready and self.bm25_index_ready)
+
+
+class ScenarioCoverage(BaseModel):
+    """How one client handles one fault scenario, as found in its LSG.
+
+    Produced by the Phase 2.5 scenario scan agent. If ``covered`` is False
+    and ``suggested_transitions`` is non-empty, Phase 2 will be asked to
+    re-iterate with those transitions as hints.
+    """
+    client: str
+    scenario_id: str
+    workflow_id: str
+    covered: bool = False                   # scenario is represented in the LSG
+    state_ids: list[str] = Field(default_factory=list)        # LSG state(s) that handle it
+    transition_guards: list[str] = Field(default_factory=list)  # triggering guards
+    evidence: Evidence | None = None
+    notes: str = ""                          # brief description of the handling
+    suggested_transitions: list[dict] = Field(default_factory=list)
+    # ^ if covered=False, LLM proposes transition(s) to add in the next iteration
 
 
 # ---- LangGraph reducers ------------------------------------------------
@@ -195,4 +217,10 @@ class GlobalState(TypedDict, total=False):
     unverified_b_diffs: Annotated[list[dict], _merge_lists]
     reclassified_to_a: Annotated[list[dict], _merge_lists]
     verification_evidence: Annotated[dict[str, list], _merge_dicts]
+
+    # Phase 2.5 — scenario scan
+    # scenario_coverages: { "{client}::{wf}::{scenario_id}" → ScenarioCoverage dict }
+    scenario_coverages: Annotated[dict[str, dict], _merge_dicts]
+    # which (workflow_id, scenario_id) pairs have already triggered a re-iterate
+    scenario_triggered_reiter: Annotated[list[str], _merge_lists]
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Iteration limits & convergence
@@ -156,6 +157,137 @@ ENTRY_POINT_PATH_MARKERS: dict[str, list[str]] = {
         "executionengine", "/engine/", "engine_api",
     ],
 }
+
+# ── Fault scenarios for Phase 2.5 scenario scan ─────────────────────────────
+#
+# Each Scenario defines a concrete abnormal situation that an Ethereum
+# consensus node may encounter. The scan agent searches for how each client
+# handles the scenario and maps findings back to the LSG.
+#
+# search_queries   — targeted RAG queries to locate the handling code
+# relevant_workflows — which Phase 2 workflows to scan after convergence
+
+
+@dataclass
+class Scenario:
+    id: str
+    name: str
+    trigger: str            # one-line trigger condition
+    risk: str               # consequence of NOT handling this
+    search_queries: list[str]
+    relevant_workflows: list[str] = field(default_factory=list)
+
+
+SCENARIOS: list[Scenario] = [
+    Scenario(
+        id="sync_stall",
+        name="同步停滞",
+        trigger="同步进程中长时间（N slot）无新区块确认",
+        risk="节点卡在过期分叉，错过最终确定性",
+        search_queries=[
+            "stall detection sync no progress timeout",
+            "sync chain reset backoff retry peer rotation",
+            "lastFetchedSlot checkProgress batchTimeout stalled",
+            "peer rotation replacement on sync failure",
+        ],
+        relevant_workflows=["initial_sync", "regular_sync"],
+    ),
+    Scenario(
+        id="reorg_during_sync",
+        name="同步中 Reorg",
+        trigger="initial_sync 过程中发生链重组，尤其跨 epoch 边界",
+        risk="sync target 不一致、epoch 边界状态错误",
+        search_queries=[
+            "reorg during sync reset fork choice finalization",
+            "finalized checkpoint changed mid-sync clear caches",
+            "epoch boundary reorg justified finalized update",
+            "handleReorg onReorg resetSyncChain clearRequestCaches",
+        ],
+        relevant_workflows=["initial_sync", "regular_sync"],
+    ),
+    Scenario(
+        id="el_invalid_cascade",
+        name="EL INVALID + 错误 latestValidHash",
+        trigger="engine_newPayload 返回 INVALID，latestValidHash 指向错误祖先",
+        risk="正确区块被级联作废，节点从错误祖先开始分叉",
+        search_queries=[
+            "latestValidHash INVALID cascade invalidate descendants rollback",
+            "removeInvalidBlockAndState SetOptimisticToInvalid",
+            "invalid payload latest valid hash verification ancestor",
+            "fork choice rollback on invalid execution payload",
+        ],
+        relevant_workflows=["execute_layer_relation"],
+    ),
+    Scenario(
+        id="el_syncing_stuck",
+        name="EL 持续 SYNCING（optimistic 锁定）",
+        trigger="EL 长期返回 SYNCING，CL 进入永久 optimistic 状态",
+        risk="链安全由 EL 保障失效，攻击者可控制 optimistic head",
+        search_queries=[
+            "optimistic depth limit exceeded threshold max",
+            "optimistic sync stuck indefinitely timeout disconnected",
+            "IsOptimisticBlock optimistic head depth limit",
+            "EL syncing halt stop import optimistic chain exceeds",
+        ],
+        relevant_workflows=["execute_layer_relation", "regular_sync"],
+    ),
+    Scenario(
+        id="gossip_flood_ddos",
+        name="Gossip DDoS",
+        trigger="恶意 peer 大量发送 gossip 消息（区块、attestation、blob）",
+        risk="CPU 耗尽、队列满、正常消息被挤出",
+        search_queries=[
+            "rate limit gossip message processing queue bounded",
+            "peer score penalty invalid gossip flood reject",
+            "message queue max size bounded throttle",
+            "gossip validation throttle rate limit peer ban",
+        ],
+        relevant_workflows=["regular_sync"],
+    ),
+    Scenario(
+        id="missing_parent_flood",
+        name="大量孤儿区块涌入",
+        trigger="收到大量 parent 未知的区块，可能来自攻击者",
+        risk="orphan 队列无界，内存耗尽；或 peer 被无效惩罚",
+        search_queries=[
+            "orphan block unknown parent queue bounded max",
+            "missing parent request by root limit cache evict",
+            "pending block cache max size orphan pool",
+            "parent not found request peers limit flood",
+        ],
+        relevant_workflows=["regular_sync"],
+    ),
+    Scenario(
+        id="slashing_sign_order",
+        name="签名与 slashing 检查顺序",
+        trigger="验证者签名操作与 slashing DB 检查的时序关系",
+        risk="崩溃恢复时产生双重投票/提案，验证者被 slash",
+        search_queries=[
+            "slashing protection check before sign attestation block",
+            "maySign checkAndInsert slashingDB BLS signature order",
+            "sign then record slashing database crash recovery",
+            "double sign protection signing root DB write",
+        ],
+        relevant_workflows=["attestation_generate", "block_generate"],
+    ),
+    Scenario(
+        id="checkpoint_ws_violation",
+        name="Checkpoint 弱主观性违规",
+        trigger="checkpoint sync 使用过期（超出 WS 窗口）的 checkpoint",
+        risk="节点从恶意链 bootstrap，无法感知真实最终确定性",
+        search_queries=[
+            "weak subjectivity period validation checkpoint epoch boundary",
+            "WSCheckpoint isWithinWSPeriod validateAnchor too old",
+            "checkpoint outside weak subjectivity window fail ban",
+            "weak subjectivity check failure peer report error",
+        ],
+        relevant_workflows=["checkpoint_sync"],
+    ),
+]
+
+# Scenario scan configuration
+SCENARIO_SCAN_TOP_K: int = 6    # search results per query per scenario
+SCENARIO_SCAN_MAX_SNIPPETS: int = 20  # max snippets fed to LLM per scenario
 
 # Embedding models tried in order; the first available one wins
 EMBEDDING_MODELS: list[str] = [

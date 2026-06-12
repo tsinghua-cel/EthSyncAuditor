@@ -614,6 +614,46 @@ def write_diff_report(state: dict[str, Any]) -> Path:
         )
     lines.append("")
 
+    # ── 4.5. Scenario Coverage Matrix ──────────────────────────────────
+    scenario_coverages = state.get("scenario_coverages", {})
+    if scenario_coverages:
+        from config import SCENARIOS, CLIENT_NAMES as _CLIENTS
+        # Group by scenario_id
+        by_scenario: dict[str, dict[str, dict]] = {}
+        for key, cov in scenario_coverages.items():
+            sid = cov.get("scenario_id", "")
+            client = cov.get("client", "")
+            if sid and client:
+                by_scenario.setdefault(sid, {})[client] = cov
+
+        if by_scenario:
+            lines.extend([
+                "## 🎯 Fault Scenario Coverage Matrix",
+                "",
+                "Shows whether each client's LSG captures handling for each "
+                "predefined fault scenario. ✅ = covered, ❌ = not found, — = not scanned.",
+                "",
+                f"| Scenario | " + " | ".join(_CLIENTS) + " |",
+                "|---" * (len(_CLIENTS) + 1) + "|",
+            ])
+            for sc in SCENARIOS:
+                sid = sc.id
+                if sid not in by_scenario:
+                    continue
+                cells = []
+                for c in _CLIENTS:
+                    cov = by_scenario[sid].get(c)
+                    if cov is None:
+                        cells.append("—")
+                    elif cov.get("covered"):
+                        guards = cov.get("transition_guards", [])
+                        g = f"({guards[0]})" if guards else ""
+                        cells.append(f"✅{g}")
+                    else:
+                        cells.append("❌")
+                lines.append(f"| `{sid}` | " + " | ".join(cells) + " |")
+            lines.append("")
+
     # ── 5. A-Class Vocabulary Alignment Diffs ──────────────────────────
     if a_diffs:
         lines.extend([
