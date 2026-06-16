@@ -30,6 +30,15 @@ class Transition(BaseModel):
     # Scenario IDs for which this transition is the handling point.
     # Populated by Phase 2.5 scenario scan; empty = no scenario annotation.
     scenario_ids: list[str] = Field(default_factory=list)
+    # Classifies the nature of this transition:
+    #   "normal"   — happy-path flow (default)
+    #   "error"    — handles a failure, timeout, or rejection (e.g. peer ban,
+    #                invalid payload, slashing protection failure, EL disconnect)
+    #   "boundary" — triggered by a protocol-defined threshold, timing window,
+    #                epoch/fork transition, capacity limit, or cutoff (e.g.
+    #                epoch boundary process_epoch, 1/3-slot proposer boost,
+    #                Deneb fork activation, optimistic depth limit exceeded)
+    transition_type: str = "normal"
 
 
 class LSGState(BaseModel):

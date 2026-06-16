@@ -19,7 +19,7 @@ slashing.
 {% for wf in lsg.workflows if wf.id == current_workflow %}
 **{{ wf.id }}** ({{ wf.states | length }} states)
 {% for st in wf.states %}
-`{{ st.id }}` [{{ st.category }}]{% for tr in st.transitions %} → ({{ tr.guard }}) [{{ tr.actions | join(', ') }}] → {{ tr.next_state }}{% endfor %}{% if not st.transitions %} — terminal{% endif %}
+`{{ st.id }}` [{{ st.category }}]{% for tr in st.transitions %} → ({{ tr.guard }}) [{{ tr.actions | join(', ') }}] → {{ tr.next_state }} [{{ tr.transition_type | default('normal') }}]{% endfor %}{% if not st.transitions %} — terminal{% endif %}
 
 {% endfor %}
 {% endfor %}

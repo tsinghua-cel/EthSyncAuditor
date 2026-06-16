@@ -207,6 +207,62 @@ Do NOT copy or force-fit skeleton examples from the LSG Spec.
   snippets above**. If a transition is not directly visible in a snippet, leave evidence null.
   Do NOT invent plausible-looking file paths — null is correct, invented paths are wrong.
 
+### ⚠️ ERROR PATH EXTRACTION (required, not optional)
+
+**Error handling transitions are as important as the happy path.**
+For each stage of the workflow, look for transitions that represent:
+
+1. **Failure detection**: What condition indicates the operation failed?
+   (e.g., timeout expired, invalid data received, peer disconnected, API returned error)
+2. **Error recovery**: What does the code do in response?
+   (e.g., retry with different peer, fallback to local, skip duty, enter stalled state)
+3. **Peer / resource penalty**: Does the client penalise a peer, ban it, or
+   reduce its score? Does it close a connection or discard a pool entry?
+4. **Fatal vs. recoverable**: Does the client crash/shutdown or retry?
+   (e.g., `panic`, `System.exit`, graceful retry loop)
+
+For each error-path transition, set `transition_type = "error"` in the output.
+
+**Examples of what to look for in code** (do not invent — only extract from snippets):
+- `catch/except/match Err(...)` blocks that branch into a different state
+- Functions returning early with an error (`return nil, err` / `bail!` / `throw`)
+- `log.Error(...)` followed by state-change logic
+- `downscorePeer`, `reportPeer`, `BanPeer`, `PeerAction::Fatal` calls
+- Timeout handlers (`time.After`, `.timeout()`, `Duration::from_secs`)
+- Circuit-breaker or fallback logic (`fallbackToLocal`, `circuitBreakerTripped`)
+
+### 🔲 BOUNDARY CONDITION EXTRACTION (required, not optional)
+
+**Boundary conditions are protocol-defined thresholds that change behaviour.**
+These are often the most security-relevant transitions because clients frequently
+diverge here. Look for:
+
+1. **Epoch boundaries**: Code gated on `slot % SLOTS_PER_EPOCH == 0`,
+   `compute_epoch_at_slot`, `process_epoch`, committee/shuffling cache rollover.
+2. **Fork/hardfork activation**: Code that checks which fork is active and
+   behaves differently post-fork (`IsAltairActive`, `IsDenebActive`,
+   `compute_fork_version`, milestone/epoch comparisons).
+3. **Timing windows**: The 1/3-slot proposer boost window, 2/3-slot aggregation
+   window, `ATTESTATION_PROPAGATION_SLOT_RANGE` (5 slots), slot deadlines.
+4. **Capacity / rate limits**: Queue size caps, orphan pool limits, optimistic
+   chain depth limit, max empty slots, peer count thresholds.
+5. **Protocol-defined cutoffs**: Weak subjectivity period, blob data availability
+   window (4096 epochs), sync committee rotation (256 epochs),
+   `MIN_VALIDATOR_WITHDRAWABILITY_DELAY`.
+
+For each boundary-condition transition, set `transition_type = "boundary"` in the output.
+
+**Examples to look for in code** (only from snippets):
+- `if (slot + 1) % SLOTS_PER_EPOCH == 0` / `is_epoch_start`
+- `if spec.altairForkEpoch <= epoch` / `if fork >= ForkName.deneb`
+- `if arrival_time < slot_start + SECONDS_PER_SLOT / 3`
+- `if orphan_count >= MAX_ORPHAN_POOL_SIZE` / `if depth >= MAX_OPTIMISTIC_DEPTH`
+- `if epoch < checkpoint.epoch + ws_period`
+- Constants like `SLOTS_PER_EPOCH`, `EPOCHS_PER_SYNC_COMMITTEE_PERIOD`,
+  `MIN_ATTESTATION_INCLUSION_DELAY` appearing in conditional logic
+
+Set `transition_type = "normal"` for all standard happy-path transitions.
+
 ### 🔍 CONSENSUS VULNERABILITY ANALYSIS
 
 In addition to the normal state machine, you MAY report **consensus-impacting

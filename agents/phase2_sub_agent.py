@@ -80,80 +80,123 @@ def _serialize_workflow_yaml(wf: dict) -> str:
 # ── Targeted multi-query retrieval ──────────────────────────────────────────
 
 # Per-workflow search queries targeting the *actual* implementation functions,
-# not spec-level concepts.  Calibrated against real function names found by
-# scanning all 5 clients.  Replace the old single "initial sync" query.
+# not spec-level concepts.  Three query tiers per workflow:
+#   (a) Normal path   — the happy path flow
+#   (b) Error path    — how each failure mode is detected and handled
+#   (c) Boundary      — epoch transitions, fork activations, timing thresholds,
+#                        capacity limits, and protocol-defined cutoffs
 _WF_SEARCH_QUERIES: dict[str, list[str]] = {
     "initial_sync": [
+        # (a) Normal path
         "range sync batch download blocks by range request",
         "forward sync peer selection suitability score",
         "batch processing import validate apply fork choice",
-        "blob sidecar by range request download deneb",
         "initial sync complete set forward synced",
-        "stall detection batch timeout backoff retry",
+        # (b) Error path
+        "stall detection no progress timeout reset retry",
         "peer penalty downscore ban invalid batch",
-        "chain reorg during sync reset clear caches",
+        "chain reorg during sync clear caches reset target",
+        "error invalid block remove retry different peer",
+        # (c) Boundary
+        "epoch boundary during sync process epoch slots",
+        "blob sidecar by range request download deneb",
+        "data availability boundary minimum epoch blob request",
     ],
     "regular_sync": [
+        # (a) Normal path
         "gossip block receive handler validate import",
         "blob sidecar gossip receive validate deneb",
-        "chain reorg detection handle reorganize head",
-        "missing parent unknown block request by root",
         "fork choice update notify after block import",
+        # (b) Error path
+        "invalid gossip block peer score penalty reject",
+        "missing parent unknown block request by root",
+        "chain reorg detection rollback invalidate fork choice",
+        "EL invalid block remove state rollback",
         "attestation buffer pending block not yet imported",
-        "peer score penalty invalid gossip message",
-        "fallback range sync head slot lag behind",
+        # (c) Boundary
+        "proposer boost timing one third slot boundary",
+        "hard fork upgrade activation altair bellatrix capella deneb",
+        "attestation propagation slot range cutoff limit",
+        "fallback range sync head slot lag behind threshold",
     ],
     "checkpoint_sync": [
+        # (a) Normal path
         "checkpoint sync anchor state initialize store",
-        "weak subjectivity validation check period boundary",
-        "backfill sync historical blocks genesis",
         "anchor state root hash verify finalized",
-        "checkpoint source fetch finalized state block",
         "forward sync after checkpoint anchor init",
-        "backfill completion data availability boundary",
+        # (b) Error path
+        "weak subjectivity check fail abort reject checkpoint",
+        "checkpoint source unreachable fetch error retry",
+        "anchor state verification mismatch abort",
+        # (c) Boundary
+        "weak subjectivity period boundary validation epoch window",
+        "backfill completion data availability boundary minimum epoch",
+        "backfill sync historical blocks genesis",
     ],
     "attestation_generate": [
+        # (a) Normal path
         "attester duty committee slot assignment fetch",
         "attestation data source target head beacon",
-        "slashing protection check before sign attestation",
         "sign attestation BLS key validator",
         "publish submit attestation subnet topic",
-        "attestation timing wait one third slot",
-        "electra single attestation format fork aware",
+        # (b) Error path
+        "slashing protection check failure skip duty abort",
+        "beacon node unreachable timeout retry attestation",
+        "attestation submission failed error",
+        # (c) Boundary
+        "attestation timing one third slot window boundary",
+        "epoch boundary target epoch staleness duty refresh",
+        "electra single attestation format fork activation boundary",
     ],
     "block_generate": [
+        # (a) Normal path
         "proposer duty block proposal slot fetch",
         "engine forkchoiceUpdated payload attributes trigger",
         "engine getPayload local payload retrieve",
         "beacon block body assemble attestations deposits slashings",
         "sign block proposer key slashing protection",
-        "broadcast publish signed block gossip",
-        "MEV boost builder bid external circuit breaker",
-        "blob KZG commitment sidecar attach deneb",
+        # (b) Error path
+        "MEV boost builder failure circuit breaker fallback local",
+        "execution payload timeout fallback skip slot",
+        "block proposal slashing protection error skip",
+        # (c) Boundary
+        "blob KZG commitment sidecar deneb activation boundary",
+        "payload deadline timeout threshold end of slot",
+        "builder registration deadline MEV boost window",
     ],
     "aggregate": [
+        # (a) Normal path
         "aggregator selection proof VRF compute",
         "committee attestation subnet subscription",
-        "collect unaggregated attestations wait two thirds slot",
         "aggregate and proof BLS combine signatures",
         "publish submit aggregate and proof global topic",
-        "selection proof is aggregator check",
+        # (b) Error path
         "empty aggregate skip no attestations collected",
+        "aggregation failure error subnet subscription fail",
+        # (c) Boundary
+        "aggregation timing two thirds slot window boundary",
+        "sync committee period rotation boundary 256 epochs",
+        "selection proof is aggregator threshold check",
     ],
     "execute_layer_relation": [
+        # (a) Normal path
         "engine newPayload execution payload validate",
-        "payload status VALID INVALID SYNCING handle",
         "forkchoiceUpdated head safe finalized notify",
         "optimistic import block EL syncing state",
-        "invalid payload invalidate descendants rollback chain",
-        "optimistic sync depth limit exceeded threshold",
-        "engine API connection timeout reconnect",
-        "blob versioned hashes validate deneb newPayloadV3",
+        # (b) Error path
+        "invalid payload invalidate descendants rollback chain latestValidHash",
+        "EL disconnected timeout reconnect engine API error",
+        "INVALID cascade wrong latestValidHash error recovery",
+        # (c) Boundary
+        "optimistic sync depth limit exceeded threshold boundary",
+        "blob versioned hashes validate deneb newPayloadV3 activation",
+        "payload status VALID INVALID SYNCING ACCEPTED distinction",
+        "engine API connection timeout threshold recovery",
     ],
 }
 
-_MAX_CODE_CONTEXT_CHARS: int = 24_000   # increased from 12k
-_MAX_SNIPPETS: int = 30                  # increased from 15
+_MAX_CODE_CONTEXT_CHARS: int = 32_000   # increased to cover error+boundary paths
+_MAX_SNIPPETS: int = 40                  # increased from 30
 _SNIPPET_CHARS: int = 600
 
 
