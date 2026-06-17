@@ -261,20 +261,32 @@ def _retrieve_code_context(
             logger.debug("[_retrieve_code_context] query failed q=%s", query, exc_info=True)
 
     # ── Verification queries: guard/action names from previous iteration ──
-    # Only search terms that appeared in the previous LSG iteration so we can
-    # verify them against real code; skip if they were obviously invented
-    # (PascalCase names not found in the query corpus rarely resolve).
+    # Split previous-iteration guards/actions by transition_type:
+    #   - "normal" guards: use them for verification (they may be hallucinated
+    #     and need real-code backing)
+    #   - "error"/"boundary" guards: skip verification (they're already targeting
+    #     the right code tier; re-verifying them would just return more normal-path
+    #     snippets and reinforce the happy-path bias)
+    # Then use any saved budget to force additional error-path queries for this
+    # iteration, counteracting the tendency to fixate on normal-path code.
     if prev_wf and iteration > 1 and total_chars < _MAX_CODE_CONTEXT_CHARS:
-        terms: set[str] = set()
+        normal_terms: set[str] = set()
+        error_boundary_count = 0
         for st in prev_wf.get("states", []):
             for tr in st.get("transitions", []):
+                ttype = tr.get("transition_type", "normal")
                 g = tr.get("guard", "")
                 if g and g not in ("TRUE", "*"):
-                    terms.add(g)
+                    if ttype == "normal":
+                        normal_terms.add(g)
+                    else:
+                        error_boundary_count += 1
                 for a in tr.get("actions", []):
-                    if a:
-                        terms.add(a)
-        for term in list(terms)[:8]:
+                    if a and ttype == "normal":
+                        normal_terms.add(a)
+
+        # Verify normal-path guards (cap at 6 to leave budget for error top-ups)
+        for term in list(normal_terms)[:6]:
             if total_chars >= _MAX_CODE_CONTEXT_CHARS:
                 break
             try:
@@ -287,6 +299,33 @@ def _retrieve_code_context(
                 _add(results, f"verify:{term}")
             except Exception:
                 pass
+
+        # If error/boundary coverage is low (<3 previous transitions), force
+        # additional error-path queries to break the normal-path feedback loop.
+        if error_boundary_count < 3 and total_chars < _MAX_CODE_CONTEXT_CHARS:
+            forced_error_queries = [
+                f"{workflow_id.replace('_', ' ')} error handler failure recovery",
+                f"{workflow_id.replace('_', ' ')} timeout retry backoff",
+                f"{workflow_id.replace('_', ' ')} boundary condition epoch fork limit",
+            ]
+            logger.info(
+                "[_retrieve_code_context] client=%s wf=%s — low error/boundary "
+                "coverage (%d), forcing %d extra error-path queries",
+                client_name, workflow_id, error_boundary_count, len(forced_error_queries),
+            )
+            for query in forced_error_queries:
+                if total_chars >= _MAX_CODE_CONTEXT_CHARS:
+                    break
+                try:
+                    results = search_codebase_by_workflow(
+                        workflow_id=workflow_id,
+                        query=query,
+                        client_name=client_name,
+                        top_k=4,
+                    )
+                    _add(results, f"error_topup:{query}")
+                except Exception:
+                    pass
 
     logger.info(
         "[_retrieve_code_context] client=%s wf=%s iter=%d — %d snippets (%d chars)",
@@ -358,6 +397,15 @@ def _ground_workflow(
 ) -> tuple[dict, int, int]:
     """Replace hallucinated evidence with None; keep real evidence as-is.
 
+    Grounding strategy by transition type:
+    - "normal": evidence must be in the retrieved snippet pool (or a basename
+      match), otherwise cleared. This is the strict check.
+    - "error" / "boundary": evidence is accepted if the file exists on disk
+      under code/{client_name}/, even when it was not retrieved by the
+      normal-path queries. Error handlers and boundary guards often live in
+      dedicated files (errors.go, error.rs, exceptions/) that won't appear
+      in normal-path search results but are real code.
+
     Returns (grounded_workflow, kept_count, cleared_count).
     """
     full_paths, basenames, _ = _build_evidence_pools(snippets, client_name)
@@ -367,11 +415,28 @@ def _ground_workflow(
             ev = tr.get("evidence")
             if ev is None:
                 continue
-            if _evidence_is_real(ev, full_paths, basenames, client_name):
-                kept += 1
-            else:
+
+            ttype = tr.get("transition_type", "normal")
+
+            if ttype in ("error", "boundary"):
+                # Relaxed check: disk existence is sufficient.
+                # Error/boundary files are rarely in the retrieval pool but
+                # are real code that the LLM correctly identifies.
+                ev_file = ev.get("file", "")
+                if ev_file:
+                    disk_path = CODE_BASE_PATH / client_name / ev_file
+                    if disk_path.exists() or _evidence_is_real(ev, full_paths, basenames, client_name):
+                        kept += 1
+                        continue
                 tr["evidence"] = None
                 cleared += 1
+            else:
+                # Strict check for normal-path transitions.
+                if _evidence_is_real(ev, full_paths, basenames, client_name):
+                    kept += 1
+                else:
+                    tr["evidence"] = None
+                    cleared += 1
     return wf, kept, cleared
 
 

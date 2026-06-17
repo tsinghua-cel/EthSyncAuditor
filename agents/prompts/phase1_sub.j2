@@ -28,10 +28,22 @@ the ONLY evidence you may use.
 From the snippets above, identify **Guard conditions** and **Action
 side-effects** that are present in the code AND not already in the vocabulary.
 
+**Three types of entries to look for** (all are equally valuable):
+
+1. **Normal-path** entries — happy-path predicates and actions
+2. **Error-handling** entries — guards that detect failures, actions that
+   handle them (e.g. `IsBatchTimeout`, `IsInvalidPayload`, `BanPeer`,
+   `FallbackToLocal`, `CircuitBreakerTripped`)
+3. **Boundary-condition** entries — guards triggered at protocol thresholds
+   (e.g. `IsEpochBoundary`, `IsDenebActive`, `IsOneThirdSlot`,
+    `IsOptimisticDepthExceeded`, `IsWeakSubjectivityPeriodExpired`)
+
 For each entry provide:
 1. **name**: a concise PascalCase name
 2. **category**: one of (network, time, validation, validator, exec, mode,
-   block, peer, state, fork, committee, other)
+   block, peer, state, fork, committee, error, boundary)
+   Use `error` for failure-handling guards/actions; `boundary` for
+   threshold/transition-point guards/actions.
 3. **description**: one-sentence semantic description
 4. **evidence**: copy the **exact** `file`, `function` and `line` range from
    the snippet the entry came from (fields: evidence_file, evidence_function,

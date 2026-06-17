@@ -614,7 +614,40 @@ def write_diff_report(state: dict[str, Any]) -> Path:
         )
     lines.append("")
 
-    # ── 4.5. Scenario Coverage Matrix ──────────────────────────────────
+    # ── 4.5. LSG Transition Type Coverage ──────────────────────────────
+    client_lsgs = state.get("client_lsgs", {})
+    if client_lsgs:
+        # Count normal/error/boundary transitions per client
+        type_counts: dict[str, Counter] = {}
+        for client, lsg in client_lsgs.items():
+            c: Counter = Counter({"normal": 0, "error": 0, "boundary": 0})
+            for wf in lsg.get("workflows", []):
+                for st in wf.get("states", []):
+                    for tr in st.get("transitions", []):
+                        ttype = tr.get("transition_type", "normal")
+                        c[ttype if ttype in ("error", "boundary") else "normal"] += 1
+            type_counts[client] = c
+
+        if any(v["error"] + v["boundary"] > 0 for v in type_counts.values()):
+            lines.extend([
+                "## LSG Transition Type Coverage",
+                "",
+                "Breakdown of extracted transitions by type. Higher `error` and "
+                "`boundary` counts indicate better coverage of non-happy-path code.",
+                "",
+                "| Client | Normal | Error | Boundary | Total | Error+Boundary% |",
+                "|--------|--------|-------|----------|-------|-----------------|",
+            ])
+            for client, c in sorted(type_counts.items()):
+                total = c["normal"] + c["error"] + c["boundary"]
+                pct = (c["error"] + c["boundary"]) / max(total, 1)
+                lines.append(
+                    f"| **{client}** | {c['normal']} | {c['error']} | {c['boundary']} "
+                    f"| {total} | {pct:.0%} |"
+                )
+            lines.append("")
+
+    # ── 4.6. Scenario Coverage Matrix ──────────────────────────────────
     scenario_coverages = state.get("scenario_coverages", {})
     if scenario_coverages:
         from config import SCENARIOS, CLIENT_NAMES as _CLIENTS

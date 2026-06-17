@@ -22,11 +22,29 @@ Propose concise code-search queries that are most likely to surface Guards and
 Actions **missing** from the vocabulary above. Aim for the gaps — do not
 re-query concepts already well covered by existing names.
 
+**Three vocabulary tiers to cover** (all three matter equally):
+
+1. **Normal-path guards/actions** — the happy-path flow
+   (e.g. "is block valid", "submit attestation", "request blocks by range")
+
+2. **Error-handling guards/actions** — how failures are detected and handled
+   (e.g. "peer banned on invalid batch", "slashing protection failure skip",
+    "EL timeout fallback local", "circuit breaker tripped", "max retries exceeded")
+   These are underrepresented in most vocabularies but critical for finding
+   cross-client divergences.
+
+3. **Boundary-condition guards/actions** — protocol-defined thresholds and
+   transition points
+   (e.g. "epoch boundary process epoch", "proposer boost one third slot",
+    "Deneb fork activation", "optimistic depth limit exceeded",
+    "weak subjectivity period exceeded", "data availability window boundary")
+   These represent moments where clients frequently behave differently.
+
 Guidance:
-- Each query is a short phrase or symbol (e.g. "blob sidecar availability
-  check", "peer penalty on invalid batch", "optimistic import threshold").
+- Each query is a short phrase or symbol.
 - Tag each query with the `workflow_id` it targets (one of the ids above).
 - Prefer specific, discriminating terms over generic ones.
+- Aim for at least 1 error-path and 1 boundary query per workflow.
 - Produce 2-3 queries per workflow, at most {{ max_queries }} queries total.
 
 Return a `SearchPlan` with the `queries` list. Output only the plan — no code,

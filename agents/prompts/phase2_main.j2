@@ -145,6 +145,39 @@ configuration, a trusted checkpoint source, or local startup are NOT CRITICAL
 
 `logic_diff_rate = B-class count / total comparison items`
 
+### Step 3.6 — Error / Boundary Coverage Asymmetry
+
+**This step is specifically for the `[error]` and `[boundary]` tagged transitions.**
+
+Look at every transition marked `[error]` or `[boundary]` in ANY client's LSG above.
+For each distinct error condition or boundary condition you find:
+
+1. **Check if other clients also handle it** (look for a semantically equivalent
+   transition, even if named differently).
+2. If ≥ 2 clients handle it but ≥ 1 is **completely absent** → generate a B-class diff:
+   - `deviating_clients` = the clients that lack the handling
+   - `description` = "When [error/boundary condition X occurs], [present clients] handle
+     it via [guard/action], while [absent clients] have no equivalent transition."
+   - `severity` = MAJOR if it's an error path (unhandled failure → resource exhaustion,
+     stall, incorrect state); MINOR if it's a boundary condition difference with limited
+     direct impact
+3. If **all 5 clients handle it but differ in approach** (e.g., one bans the peer while
+   others only downscore) → generate a B-class diff describing the strategy divergence.
+4. If only **1 client** handles a condition and 4 don't, it may be a unique defensive
+   measure — report as MINOR and note which client adds it.
+
+**Do NOT generate a diff if:**
+- All clients lack the handling equally (not an asymmetry)
+- The condition is handled under a different state ID but equivalent logic exists
+
+**Examples of high-value asymmetries to look for:**
+- Error: Peer penalised/banned in some clients on invalid batch, silently ignored in others
+- Error: Slashing protection failure causes skip-duty in some but blocks/panics in others
+- Error: EL timeout triggers fallback in some, blocks forever in others
+- Boundary: Hard fork activation triggers cache flush/state upgrade in some clients but
+  not others at the exact fork slot
+- Boundary: Epoch boundary triggers specific cleanup action in some clients but not others
+
 {% if scenario_coverages %}
 ### Step 3.5 — Scenario Coverage Comparison
 
