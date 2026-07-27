@@ -143,16 +143,25 @@ def _vector_search(
     client_name: str,
     top_k: int = 5,
     filter_dict: dict | None = None,
+    allowed_functions: set[str] | None = None,
 ) -> list[SearchResult]:
-    """Search Chroma vector store and return top_k results."""
+    """Search Chroma vector store and return top_k results.
+
+    F2: when *allowed_functions* is set (the call-graph reachable set), over-
+    retrieve (k = max(top_k*3, 20)) then filter to that set. Previously the
+    vector leg ran unfiltered against the whole index and its hits were almost
+    never in the workflow subgraph, so they were post-hoc discarded and hybrid
+    search degraded to BM25-only.
+    """
     db = _load_chroma(client_name)
     if db is None:
         return []
 
+    fetch_k = max(top_k * 3, 20) if allowed_functions else top_k
     try:
         results = db.similarity_search_with_relevance_scores(
             query,
-            k=top_k,
+            k=fetch_k,
             filter=filter_dict,
         )
     except Exception:
@@ -161,11 +170,15 @@ def _vector_search(
 
     out: list[SearchResult] = []
     for doc, score in results:
-        out.append(SearchResult(
-            content=doc.page_content,
-            metadata=doc.metadata,
-            score=float(score),
-        ))
+        meta = doc.metadata
+        if allowed_functions is not None:
+            qn = meta.get("qualified_name", "")
+            fn = meta.get("function_name", "")
+            if qn not in allowed_functions and fn not in allowed_functions:
+                continue
+        out.append(SearchResult(content=doc.page_content, metadata=meta, score=float(score)))
+        if len(out) >= top_k:
+            break
     return out
 
 
@@ -198,31 +211,33 @@ def search_codebase(
     return _fuse_results(bm25_results, vector_results, top_k)
 
 
-# Mode B — call-graph directed hybrid search (Phase 2)
+# Mode B — call-graph directed hybrid search (Phase 2 / parameter track)
 
 
-def search_codebase_by_workflow(
-    workflow_id: str,
+def search_codebase_by_domain(
+    domain_id: str,
     query: str,
     client_name: str,
-    max_call_depth: int = 5,
+    max_call_depth: int = 7,
     top_k: int = 10,
 ) -> list[SearchResult]:
-    """Call-graph directed hybrid search for LSG extraction.
+    """Call-graph directed hybrid search for one analysis domain.
 
-    1. From callgraph, get entry_points for *workflow_id*.
-    2. BFS up to *max_call_depth*, collecting reachable function names.
-    3. Search within that function set using hybrid retrieval.
-    4. Sort results by call_depth ascending (closest to entry first).
+    *domain_id* may be a workflow id or a subsystem domain id (discv5,
+    peer_scoring, ...). 1. Look up entry_points[domain_id] in the callgraph.
+    2. BFS up to *max_call_depth*. 3. Hybrid search within the reachable
+    function set (F2: the vector leg over-retrieves then filters to the set).
+    4. Sort by call_depth ascending. Falls back to whole-index search when no
+    callgraph or no entry points exist for the domain.
     """
     cg = _load_callgraph(client_name)
     if cg is None:
         logger.warning("No callgraph for %s — falling back to full search", client_name)
         return search_codebase(query, client_name, top_k)
 
-    entry_fns: list[str] = cg.get("entry_points", {}).get(workflow_id, [])
+    entry_fns: list[str] = cg.get("entry_points", {}).get(domain_id, [])
     if not entry_fns:
-        logger.info("No entry points for %s/%s — full search fallback", client_name, workflow_id)
+        logger.info("No entry points for %s/%s — full search fallback", client_name, domain_id)
         return search_codebase(query, client_name, top_k)
 
     # Build adjacency
@@ -246,23 +261,32 @@ def search_codebase_by_workflow(
                 reachable.add(callee)
                 queue.append((callee, depth + 1))
 
-    # Search within reachable set
+    # Search within reachable set (F2: vector leg filters to the set).
     bm25_results = _bm25_search(query, client_name, top_k=top_k, allowed_functions=reachable)
-    vector_results = _vector_search(query, client_name, top_k=top_k)
+    vector_results = _vector_search(query, client_name, top_k=top_k, allowed_functions=reachable)
 
-    # Filter vector results to reachable set
-    filtered_vector: list[SearchResult] = []
-    for r in vector_results:
-        qn = r.metadata.get("qualified_name", "")
-        fn = r.metadata.get("function_name", "")
-        if qn in reachable or fn in reachable:
-            filtered_vector.append(r)
-
-    fused = _fuse_results(bm25_results, filtered_vector, top_k)
+    fused = _fuse_results(bm25_results, vector_results, top_k)
 
     # Sort by call_depth ascending
     fused.sort(key=lambda r: r.metadata.get("call_depth", 999))
     return fused
+
+
+def search_codebase_by_workflow(
+    workflow_id: str,
+    query: str,
+    client_name: str,
+    max_call_depth: int = 7,   # F3: was 5 — error/recovery subgraphs live deeper
+    top_k: int = 10,
+) -> list[SearchResult]:
+    """Call-graph directed hybrid search for a workflow domain.
+
+    Thin wrapper over :func:`search_codebase_by_domain` (a workflow id is a
+    domain id). Kept for backward compatibility with existing callers/tests.
+    """
+    return search_codebase_by_domain(
+        workflow_id, query, client_name, max_call_depth=max_call_depth, top_k=top_k,
+    )
 
 
 # Fusion helper

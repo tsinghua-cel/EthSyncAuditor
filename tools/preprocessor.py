@@ -28,6 +28,7 @@ from config import (
     LANGUAGE_GRAMMARS,
     PREPROCESS_PATH,
     WORKFLOW_IDS,
+    all_domains,
 )
 
 logger = logging.getLogger(__name__)
@@ -308,13 +309,13 @@ def _build_callgraph(client_name: str, symbols: list[SymbolInfo]) -> CallGraph:
             out = out.replace(ch, "")
         return out
 
-    for wf_id in WORKFLOW_IDS:
-        if wf_id in overrides:
-            entry_points[wf_id] = overrides[wf_id]
+    for dom in all_domains():
+        if dom.id in overrides:
+            entry_points[dom.id] = overrides[dom.id]
             continue
 
-        keywords = ENTRY_POINT_KEYWORDS.get(wf_id, [])
-        path_markers = ENTRY_POINT_PATH_MARKERS.get(wf_id, [])
+        keywords = dom.entry_keywords
+        path_markers = dom.entry_path_markers
         matched_by_name = 0
         matched_by_path = 0
         matched: list[str] = []
@@ -323,13 +324,13 @@ def _build_callgraph(client_name: str, symbols: list[SymbolInfo]) -> CallGraph:
             if _is_test_symbol(sym):
                 continue
             # Signal 1+2: function name or qualified name (catches receiver /
-            # class-qualified names) contains a workflow keyword.
+            # class-qualified names) contains a domain keyword.
             name_hit = False
             if keywords:
                 fn_norm = _norm(sym.function_name)
                 qn_norm = _norm(sym.qualified_name)
                 name_hit = any(kw in fn_norm or kw in qn_norm for kw in keywords)
-            # Signal 3: the symbol lives in a workflow-specific module/path.
+            # Signal 3: the symbol lives in a domain-specific module/path.
             path_hit = False
             if not name_hit and path_markers:
                 file_lower = sym.file.lower()
@@ -344,10 +345,10 @@ def _build_callgraph(client_name: str, symbols: list[SymbolInfo]) -> CallGraph:
                 matched_by_name += 1
             else:
                 matched_by_path += 1
-        entry_points[wf_id] = matched
+        entry_points[dom.id] = matched
         logger.info(
-            "[_build_callgraph] client=%s wf=%s entry_points=%d (name=%d path=%d)",
-            client_name, wf_id, len(matched), matched_by_name, matched_by_path,
+            "[_build_callgraph] client=%s domain=%s kind=%s entry_points=%d (name=%d path=%d)",
+            client_name, dom.id, dom.kind, len(matched), matched_by_name, matched_by_path,
         )
 
     cg = CallGraph(

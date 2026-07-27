@@ -51,7 +51,7 @@ def _retrieve(domain, client_name: str) -> list[dict]:
     """Retrieve subsystem code via the domain's seeded queries (whole-index
     hybrid search — subsystems are not workflow-scoped)."""
     try:
-        from tools.search import search_codebase
+        from tools.search import search_codebase_by_domain
     except ImportError:
         logger.debug("[param_sub] tools.search unavailable")
         return []
@@ -66,7 +66,10 @@ def _retrieve(domain, client_name: str) -> list[dict]:
         if acc.full:
             break
         try:
-            for r in search_codebase(q, client_name, top_k=domain.top_k_per_query):
+            for r in search_codebase_by_domain(
+                domain.id, q, client_name,
+                max_call_depth=domain.max_call_depth, top_k=domain.top_k_per_query,
+            ):
                 acc.add(r)
         except Exception:
             logger.debug("[param_sub] query failed q=%s", q, exc_info=True)
