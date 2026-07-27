@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import operator
 from typing import Annotated, Any, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class VocabEntry(BaseModel):
@@ -22,11 +23,74 @@ class Evidence(BaseModel):
     lines: list[int] = Field(default_factory=list)
 
 
+class MethodCall(BaseModel):
+    """A single method invoked by a transition's action, with its own evidence.
+
+    Populates ``Transition.method_calls`` so an action can be tied to the
+    concrete call-site that performs it (F4). ``normalized_method`` is the
+    canonical, vocabulary-aligned name used for cross-client matching.
+    """
+
+    name: str
+    normalized_method: str = ""
+    evidence: Evidence | None = None
+
+
+# ── Parameter / behavior-divergence layer ────────────────────────────────────
+# Captures constants, thresholds, and algorithm-shape differences across clients
+# that do NOT fit the FSM ``Transition`` model (e.g. discv5 rate-limit values,
+# peer-scoring weights/ban thresholds). See docs & the refactor plan.
+
+
+class ParameterValue(BaseModel):
+    """One client's value for one :class:`BehaviorAspect`."""
+
+    client: str
+    value: str                       # "250000", "per-IP 9/s + total 10/s", "absent", ...
+    value_type: str = "literal"      # literal | absent | defined_but_unused | structural
+    evidence: Evidence | None = None
+    notes: str = ""
+
+
+class BehaviorAspect(BaseModel):
+    """One cross-client comparable row within a subsystem domain.
+
+    e.g. ``id="discv5::udp_rate_limit"``, ``aspect_type="parameter"``.
+    """
+
+    id: str                          # "{domain_id}::{slug}"
+    domain_id: str
+    name: str
+    description: str = ""
+    aspect_type: str = "parameter"   # parameter | algorithm_shape | constant | presence
+    unit: str = ""                   # "bytes/sec", "seconds", "score", ""
+    per_client: dict[str, ParameterValue] = Field(default_factory=dict)
+
+
+class ParameterDivergence(BaseModel):
+    """The parameter-layer analogue of :class:`DiffItem`."""
+
+    aspect_id: str                   # → BehaviorAspect.id
+    domain_id: str
+    name: str
+    divergence_type: str             # value_split | presence_split | algorithm_shape | constant | default_config
+    description: str
+    severity: str = "MAJOR"          # CRITICAL | MAJOR | MINOR
+    involved_clients: list[str] = Field(default_factory=list)
+    deviating_clients: list[str] = Field(default_factory=list)
+    per_client_values: dict[str, ParameterValue] = Field(default_factory=dict)
+    value_groups: dict[str, list[str]] = Field(default_factory=dict)
+    security_note: str = ""
+
+
 class Transition(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     guard: str
     actions: list[str] = Field(default_factory=list)
     next_state: str
     evidence: Evidence | None = None
+    method_calls: list[MethodCall] = Field(default_factory=list)
     # Scenario IDs for which this transition is the handling point.
     # Populated by Phase 2.5 scenario scan; empty = no scenario annotation.
     scenario_ids: list[str] = Field(default_factory=list)
@@ -58,12 +122,16 @@ class LSGWorkflow(BaseModel):
 
 
 class LSGFile(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     version: int = 1
     client: str = ""
     generated_at: str = ""
     guards: list[VocabEntry] = Field(default_factory=list)
     actions: list[VocabEntry] = Field(default_factory=list)
     workflows: list[LSGWorkflow] = Field(default_factory=list)
+    # Parameter/behavior values this client exhibits, keyed by aspect_id.
+    behavior_aspects: dict[str, ParameterValue] = Field(default_factory=dict)
 
 
 class DiffItem(BaseModel):
@@ -82,6 +150,8 @@ class DiffItem(BaseModel):
 class DiffReport(BaseModel):
     a_class_diffs: list[DiffItem] = Field(default_factory=list)
     b_class_diffs: list[DiffItem] = Field(default_factory=list)
+    parameter_divergences: list[ParameterDivergence] = Field(default_factory=list)
+    behavior_aspects: list[BehaviorAspect] = Field(default_factory=list)
     logic_diff_rate: float = 1.0
     total_transitions: int = 0
 
@@ -144,27 +214,38 @@ def _merge_lists(existing: list, new: list) -> list:
 
 
 def _merge_vocab(existing: list, new: list) -> list:
-    """Dedup by ``name``; newer entries replace older ones."""
+    """Dedup by ``(name, category)``; newer entries replace older ones.
+
+    F10: deduping by ``name`` alone silently dropped entries where two clients
+    reuse a guard/action name with different semantics. Keying on
+    ``(name, category)`` keeps same-name-different-category entries distinct.
+    """
     if existing is None:
         existing = []
     if new is None:
         new = []
-    seen: dict[str, int] = {}
+
+    def _key(entry: Any) -> tuple[str, str]:
+        if isinstance(entry, dict):
+            return (entry.get("name", ""), entry.get("category", ""))
+        return (str(entry), "")
+
+    seen: dict[tuple[str, str], int] = {}
     result: list = []
     for entry in existing:
-        name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
-        if name and name not in seen:
-            seen[name] = len(result)
+        key = _key(entry)
+        if key[0] and key not in seen:
+            seen[key] = len(result)
             result.append(entry)
-        elif not name:
+        elif not key[0]:
             result.append(entry)
     for entry in new:
-        name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
-        if name and name in seen:
-            result[seen[name]] = entry
+        key = _key(entry)
+        if key[0] and key in seen:
+            result[seen[key]] = entry
         else:
-            if name:
-                seen[name] = len(result)
+            if key[0]:
+                seen[key] = len(result)
             result.append(entry)
     return result
 
@@ -232,4 +313,17 @@ class GlobalState(TypedDict, total=False):
     scenario_coverages: Annotated[dict[str, dict], _merge_dicts]
     # which (workflow_id, scenario_id) pairs have already triggered a re-iterate
     scenario_triggered_reiter: Annotated[list[str], _merge_lists]
+
+    # ── Parameter / behavior-divergence layer (subsystem domains) ──────────
+    current_domain: str
+    completed_domains: Annotated[list[str], _merge_lists]
+    domain_diff_reports: Annotated[dict[str, dict], _merge_dicts]
+    # {client: {aspect_id: ParameterValue dict}}
+    client_aspects: Annotated[dict[str, dict], _merge_dicts]
+    parameter_divergences: Annotated[list[dict], _merge_lists]
+    behavior_aspects: Annotated[dict[str, dict], _merge_dicts]   # keyed by aspect_id
+
+    # ── Phase 1 failure visibility (R4) ─────────────────────────────────────
+    phase1_sub_errors: Annotated[int, operator.add]
+    phase1_sub_failed_clients: Annotated[list[str], _merge_lists]
 

@@ -357,8 +357,8 @@ snippets — not from spec descriptions, not from training memory.
 {% for snippet in code_snippets %}   - `{{ snippet.file }}`
 {% endfor %}
 2. `evidence.function` MUST be the **actual function name** shown in that snippet.
-3. `evidence.lines` MUST be within the line range `[{{ "snippet.start_line" }}, {{ "snippet.end_line" }}]`
-   of the chosen snippet (or any sub-range you observe inside it).
+3. `evidence.lines` MUST be within the line range of the chosen snippet
+   (shown as `L<start>–<end>` on each snippet header), or any sub-range you observe inside it.
 4. If a transition is not visible in any snippet, **leave evidence null** — do
    NOT invent a plausible-looking path. A null evidence is honest; a hallucinated
    path destroys the value of the whole LSG.

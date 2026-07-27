@@ -18,7 +18,6 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from jinja2 import Template
 from pydantic import BaseModel, Field
 
 from config import (
@@ -29,15 +28,21 @@ from config import (
     Scenario,
 )
 from state import ScenarioCoverage
-from utils import invoke_with_retry
+
+from agents._prompts import load_template
+from agents._llm import invoke_structured
+from agents._lsg_ops import (
+    serialize_workflow_text as _serialize_wf,
+    annotate_transitions as _annotate_lsg,
+)
 
 logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "phase2_scenario.j2"
 
 
-def _load_template() -> Template:
-    return Template(_PROMPT_PATH.read_text(encoding="utf-8"))
+def _load_template():
+    return load_template("phase2_scenario.j2")
 
 
 # ── Retrieval (program, no LLM) ──────────────────────────────────────────────
@@ -104,18 +109,7 @@ class _ScenarioCoverageResult(BaseModel):
     suggested_transitions: list[dict] = Field(default_factory=list)
 
 
-def _serialize_wf(lsg: dict, wf_id: str) -> str:
-    """Return a compact text representation of the workflow's states/transitions."""
-    import yaml
-    for wf in lsg.get("workflows", []):
-        if wf.get("id") == wf_id:
-            lines = [f"workflow: {wf_id}"]
-            for st in wf.get("states", []):
-                lines.append(f"  state: {st['id']} [{st.get('category','')}]")
-                for tr in st.get("transitions", []):
-                    lines.append(f"    → {tr['guard']} → {tr['next_state']}")
-            return "\n".join(lines)
-    return f"(workflow {wf_id} not found in LSG)"
+# _serialize_wf now lives in agents._lsg_ops (imported above as _serialize_wf).
 
 
 # ── Per-client scenario evaluation ───────────────────────────────────────────
@@ -149,9 +143,8 @@ def _evaluate_one(
     )
 
     try:
-        chain = llm.with_structured_output(_ScenarioCoverageResult)
-        result: _ScenarioCoverageResult = invoke_with_retry(
-            chain, prompt,
+        result = invoke_structured(
+            llm, _ScenarioCoverageResult, prompt,
             label=f"phase2_scenario/{client_name}/{scenario.id}",
             callbacks=callbacks,
         )
@@ -244,17 +237,8 @@ def build_phase2_scenario_agent(client_name: str, llm: Any = None, callbacks: An
     return _run
 
 
-def _annotate_lsg(lsg: dict, wf_id: str, guards: list[str], scenario_id: str) -> None:
-    """Add *scenario_id* to matching transitions in the LSG (in-place)."""
-    for wf in lsg.get("workflows", []):
-        if wf.get("id") != wf_id:
-            continue
-        for st in wf.get("states", []):
-            for tr in st.get("transitions", []):
-                if tr.get("guard") in guards:
-                    existing = tr.get("scenario_ids", [])
-                    if scenario_id not in existing:
-                        tr["scenario_ids"] = existing + [scenario_id]
+# _annotate_lsg now lives in agents._lsg_ops (imported above as _annotate_lsg);
+# kept as the public name for tests/back-compat.
 
 
 def get_scenario_hints_for_reiter(

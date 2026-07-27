@@ -23,58 +23,35 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
-from jinja2 import Template
-
-from config import CODE_BASE_PATH, LANGUAGE_GRAMMARS
+from config import LANGUAGE_GRAMMARS
 from state import LSGFile
-from utils import invoke_with_retry, summarize_vocab_for_prompt
+from utils import summarize_vocab_for_prompt
+
+from agents._prompts import load_template
+from agents._llm import invoke_structured
+from agents._evidence import ground_workflow as _ground_workflow
+from agents._lsg_ops import (
+    extract_workflow as _extract_workflow,
+    replace_workflow as _replace_workflow,
+    serialize_workflow_yaml as _serialize_workflow_yaml_impl,
+)
 
 logger = logging.getLogger(__name__)
 
-_PROMPT_PATH = Path(__file__).parent / "prompts" / "phase2_sub.j2"
 
-
-def _load_prompt_template() -> Template:
-    return Template(_PROMPT_PATH.read_text(encoding="utf-8"))
-
-
-def _extract_workflow(lsg: dict, wf_id: str) -> dict | None:
-    for wf in lsg.get("workflows", []):
-        if wf.get("id") == wf_id:
-            return wf
-    return None
-
-
-def _replace_workflow(lsg: dict, wf_id: str, new_wf: dict) -> dict:
-    updated = dict(lsg)
-    new_workflows = []
-    replaced = False
-    for wf in lsg.get("workflows", []):
-        if wf.get("id") == wf_id:
-            new_workflows.append(new_wf)
-            replaced = True
-        else:
-            new_workflows.append(wf)
-    if not replaced:
-        new_workflows.append(new_wf)
-    updated["workflows"] = new_workflows
-    return updated
+def _load_prompt_template():
+    return load_template("phase2_sub.j2")
 
 
 def _serialize_workflow_yaml(wf: dict) -> str:
-    """Serialize a single workflow dict to compact YAML (evidence stripped)."""
-    wf_copy = dict(wf)
-    new_states = []
-    for st in wf_copy.get("states", []):
-        st_copy = dict(st)
-        new_trans = []
-        for tr in st_copy.get("transitions", []):
-            new_trans.append({k: v for k, v in tr.items() if k != "evidence"})
-        st_copy["transitions"] = new_trans
-        new_states.append(st_copy)
-    wf_copy["states"] = new_states
-    return yaml.dump(wf_copy, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    """Serialize one workflow to compact YAML.
+
+    F11: keep evidence so the next iteration sees which transitions were
+    well-grounded vs speculative, and can "clear evidence that points to a file
+    NOT in the snippet list" as the prompt instructs. (Previously evidence was
+    stripped, breaking the grounding feedback loop.)
+    """
+    return _serialize_workflow_yaml_impl(wf, keep_evidence=True)
 
 
 # ── Targeted multi-query retrieval ──────────────────────────────────────────
@@ -233,7 +210,13 @@ def _retrieve_code_context(
             if key in seen:
                 continue
             seen.add(key)
-            code = (r.content or "")[:_SNIPPET_CHARS]
+            # F1: budget-aware full function bodies (was a fixed 600-char cap
+            # that severed every function mid-body, hiding the error/recovery
+            # branches the prompt asks for). Take the whole body when it fits
+            # the remaining budget, else head-cut to what remains.
+            body = r.content or ""
+            budget_left = _MAX_CODE_CONTEXT_CHARS - total_chars
+            code = body if len(body) <= budget_left else body[:budget_left]
             ev_id = f"{client_name}::{workflow_id}::S{len(snippets) + 1}"
             snippets.append({
                 "id": ev_id,
@@ -335,109 +318,8 @@ def _retrieve_code_context(
 
 
 # ── Evidence grounding ───────────────────────────────────────────────────────
-
-
-def _norm_path(p: str) -> str:
-    return p.replace("\\", "/").strip().lower()
-
-
-def _build_evidence_pools(
-    snippets: list[dict], client_name: str
-) -> tuple[set[str], set[str], dict[str, str]]:
-    """Build path lookup sets from retrieved snippets.
-
-    Returns:
-        full_paths  – lowercased relative file paths as returned by the index
-        basenames   – file basenames only (for partial match fallback)
-        path_map    – lowercase path → snippet id (for resolving evidence)
-    """
-    full_paths: set[str] = set()
-    basenames: set[str] = set()
-    path_map: dict[str, str] = {}
-
-    for s in snippets:
-        fp = _norm_path(s.get("file", ""))
-        if not fp:
-            continue
-        full_paths.add(fp)
-        bn = fp.rsplit("/", 1)[-1]
-        basenames.add(bn)
-        path_map[fp] = s["id"]
-        path_map[bn] = s["id"]
-
-    # Also accept paths that exist on disk under code/{client}/ even if not
-    # retrieved (handles cases where the LLM cites a sibling file).
-    client_code = CODE_BASE_PATH / client_name
-    return full_paths, basenames, path_map
-
-
-def _evidence_is_real(
-    ev: dict | None,
-    full_paths: set[str],
-    basenames: set[str],
-    client_name: str,
-) -> bool:
-    """Return True if the evidence file is in the retrieved snippet pool OR
-    actually exists on disk under code/{client_name}/."""
-    if not ev or not ev.get("file"):
-        return False
-    fp = _norm_path(ev["file"])
-    bn = fp.rsplit("/", 1)[-1]
-    if fp in full_paths or bn in basenames:
-        return True
-    # Final safety net: check disk existence
-    disk_path = CODE_BASE_PATH / client_name / ev["file"]
-    return disk_path.exists()
-
-
-def _ground_workflow(
-    wf: dict,
-    snippets: list[dict],
-    client_name: str,
-) -> tuple[dict, int, int]:
-    """Replace hallucinated evidence with None; keep real evidence as-is.
-
-    Grounding strategy by transition type:
-    - "normal": evidence must be in the retrieved snippet pool (or a basename
-      match), otherwise cleared. This is the strict check.
-    - "error" / "boundary": evidence is accepted if the file exists on disk
-      under code/{client_name}/, even when it was not retrieved by the
-      normal-path queries. Error handlers and boundary guards often live in
-      dedicated files (errors.go, error.rs, exceptions/) that won't appear
-      in normal-path search results but are real code.
-
-    Returns (grounded_workflow, kept_count, cleared_count).
-    """
-    full_paths, basenames, _ = _build_evidence_pools(snippets, client_name)
-    kept = cleared = 0
-    for st in wf.get("states", []):
-        for tr in st.get("transitions", []):
-            ev = tr.get("evidence")
-            if ev is None:
-                continue
-
-            ttype = tr.get("transition_type", "normal")
-
-            if ttype in ("error", "boundary"):
-                # Relaxed check: disk existence is sufficient.
-                # Error/boundary files are rarely in the retrieval pool but
-                # are real code that the LLM correctly identifies.
-                ev_file = ev.get("file", "")
-                if ev_file:
-                    disk_path = CODE_BASE_PATH / client_name / ev_file
-                    if disk_path.exists() or _evidence_is_real(ev, full_paths, basenames, client_name):
-                        kept += 1
-                        continue
-                tr["evidence"] = None
-                cleared += 1
-            else:
-                # Strict check for normal-path transitions.
-                if _evidence_is_real(ev, full_paths, basenames, client_name):
-                    kept += 1
-                else:
-                    tr["evidence"] = None
-                    cleared += 1
-    return wf, kept, cleared
+# _ground_workflow now lives in agents._evidence (imported above as
+# _ground_workflow). Kept here as the public name for tests/back-compat.
 
 
 # ── Agent builder ────────────────────────────────────────────────────────────
@@ -465,7 +347,7 @@ def build_phase2_sub_agent(client_name: str, llm=None, callbacks=None):
             and fb.get("workflow_id") == current_wf
         ]
 
-        vocab = summarize_vocab_for_prompt(guards, actions, max_full_entries=80)
+        vocab = summarize_vocab_for_prompt(guards, actions, max_full_entries=120)
 
         previous_wf_yaml: str | None = None
         prev_wf = _extract_workflow(existing_lsg, current_wf)
@@ -512,9 +394,9 @@ def build_phase2_sub_agent(client_name: str, llm=None, callbacks=None):
 
         if llm is not None:
             try:
-                chain = llm.with_structured_output(LSGFile)
-                lsg: LSGFile = invoke_with_retry(
-                    chain, _prompt, label=f"phase2_sub/{client_name}/{current_wf}",
+                lsg = invoke_structured(
+                    llm, LSGFile, _prompt,
+                    label=f"phase2_sub/{client_name}/{current_wf}",
                     callbacks=callbacks,
                 )
                 lsg_dict = lsg.model_dump()

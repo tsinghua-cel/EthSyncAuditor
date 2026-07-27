@@ -10,18 +10,18 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from jinja2 import Template
-
 from state import EnrichedSpec, VocabEntry
-from utils import invoke_with_retry
+
+from agents._prompts import load_template
+from agents._llm import invoke_structured
 
 logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "phase1_main.j2"
 
 
-def _load_prompt_template() -> Template:
-    return Template(_PROMPT_PATH.read_text(encoding="utf-8"))
+def _load_prompt_template():
+    return load_template("phase1_main.j2")
 
 
 def build_phase1_main_agent(llm=None, callbacks=None):
@@ -46,9 +46,8 @@ def build_phase1_main_agent(llm=None, callbacks=None):
                 discovery_reports=reports,
             )
             try:
-                chain = llm.with_structured_output(EnrichedSpec)
-                spec: EnrichedSpec = invoke_with_retry(
-                    chain, _prompt, label="phase1_main",
+                spec = invoke_structured(
+                    llm, EnrichedSpec, _prompt, label="phase1_main",
                     callbacks=callbacks,
                 )
                 new_guards = [g.model_dump() for g in spec.guards

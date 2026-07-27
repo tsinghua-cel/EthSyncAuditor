@@ -34,7 +34,9 @@ from file_io.writer import (
     write_all_final_lsgs,
     write_diff_report,
     write_diff_report_json,
+    write_enriched_spec,
     write_false_positives_report,
+    write_parameter_divergence_report,
     write_unverified_report,
 )
 from graph import compile_graph, configure_graph, make_initial_state
@@ -295,6 +297,11 @@ def main() -> None:
         write_diff_report_json(final_state)
         write_false_positives_report(final_state)
         write_unverified_report(final_state)
+        # R3: (re)write the Global spec at pipeline end so it reflects the
+        # vocabulary actually used (and is rebuilt from LSGs if phase1 failed).
+        write_enriched_spec(final_state)
+        # Parameter / behavior-divergence report (subsystem domains).
+        write_parameter_divergence_report(final_state)
 
     save_checkpoint(
         final_state,

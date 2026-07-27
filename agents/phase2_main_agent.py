@@ -13,19 +13,20 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from jinja2 import Template
-
 from config import CLIENT_NAMES, WORKFLOW_IDS
 from state import DiffItem, DiffReport
-from utils import compute_lsg_sparsity, invoke_with_retry
+from utils import compute_lsg_sparsity
+
+from agents._prompts import load_template
+from agents._llm import invoke_structured
 
 logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "phase2_main.j2"
 
 
-def _load_prompt_template() -> Template:
-    return Template(_PROMPT_PATH.read_text(encoding="utf-8"))
+def _load_prompt_template():
+    return load_template("phase2_main.j2")
 
 
 # ── Comparison helpers ──────────────────────────────────────────────────
@@ -48,7 +49,7 @@ def _next_cat(state_id: str) -> str:
     return state_id.rsplit(".", 1)[-1] if "." in state_id else state_id
 
 
-_MATCH_THRESHOLD = 0.45  # minimum similarity score to consider A-class
+_MATCH_THRESHOLD = 0.55  # minimum similarity score to consider A-class (F6: was 0.45)
 
 
 def _transition_similarity(
@@ -58,10 +59,18 @@ def _transition_similarity(
     """Score how similar two transitions are (0.0 – 1.0).
 
     Weights: guard name 30 %, action Jaccard 45 %, destination category 25 %.
+
+    F6: a transition may NOT be declared an A-class rename when the two action
+    sets are fully disjoint AND the guards differ — that used to let a match
+    clear the threshold on guard+destination alone (0.30 + 0.25 = 0.55 ≥ 0.45),
+    collapsing genuinely different error paths into one "rename" directive.
+    Require either a shared action (a_score > 0) or an identical guard.
     """
     g_score = 1.0 if guard_a == guard_b else 0.0
     a_score = _jaccard(set(actions_a), set(actions_b))
     n_score = 1.0 if next_a == next_b else 0.0
+    if a_score == 0.0 and g_score < 1.0:
+        return 0.0
     return 0.30 * g_score + 0.45 * a_score + 0.25 * n_score
 
 
@@ -343,9 +352,8 @@ def build_phase2_main_agent(llm=None, callbacks=None):
                 scenario_coverages=wf_scenario_cov,
             )
             try:
-                chain = llm.with_structured_output(DiffReport)
-                report: DiffReport = invoke_with_retry(
-                    chain, _prompt, label="phase2_main",
+                report = invoke_structured(
+                    llm, DiffReport, _prompt, label="phase2_main",
                     callbacks=callbacks,
                 )
                 a_feedback = [d.model_dump() for d in report.a_class_diffs]
@@ -542,6 +550,12 @@ def _deterministic_compare(
                     oj = unmatched_other[k]
                     rg, ra, rn, rev = ref_transitions[ri]
                     og, oa, on, oev = other_transitions[oj]
+                    # F6: positional fallback is only valid when the two
+                    # transitions share a destination or at least one action —
+                    # otherwise we'd be pairing unrelated error paths by list
+                    # order. Unpaired leftovers correctly fall through to B-class.
+                    if rn != on and not (set(ra) & set(oa)):
+                        continue
                     matched_ref.add(ri)
                     matched_other.add(oj)
                     a_diffs.append({

@@ -84,6 +84,16 @@ def make_initial_state() -> dict[str, Any]:
         "verification_evidence": {},
         "scenario_coverages": {},
         "scenario_triggered_reiter": [],
+        # Parameter / behavior-divergence layer (subsystem domains)
+        "current_domain": "",
+        "completed_domains": [],
+        "domain_diff_reports": {},
+        "client_aspects": {},
+        "parameter_divergences": [],
+        "behavior_aspects": {},
+        # Phase 1 failure visibility (R4)
+        "phase1_sub_errors": 0,
+        "phase1_sub_failed_clients": [],
     }
 
 
@@ -166,15 +176,27 @@ def phase1_fanout(state: GlobalState) -> list[Send]:
 def route_after_phase1_main(state: GlobalState) -> str:
     iteration = state.get("phase1_iteration", 1)
     diff_rate = state.get("diff_rate", 1.0)
+    errors = state.get("phase1_sub_errors", 0)
+    vocab_size = len(state.get("guards", [])) + len(state.get("actions", []))
 
-    if diff_rate < config.CONVERGENCE_THRESHOLD:
+    # R1: a zero diff_rate means "nothing new" — but it must NOT count as
+    # convergence when the vocabulary is still empty or sub-agents errored
+    # (e.g. every LLM call failed on out-of-credit 429s). That previously
+    # declared convergence on iteration 1 and produced an empty Global spec.
+    healthy = vocab_size > 0 and errors == 0
+    if healthy and diff_rate < config.CONVERGENCE_THRESHOLD:
         logger.info("[router_phase1] converged iter=%d diff_rate=%.4f",
                     iteration, diff_rate)
         return "phase1_done"
     if iteration >= config.MAX_ITER_PHASE1:
-        logger.warning("[router_phase1] max iterations reached (diff_rate=%.4f)",
-                       diff_rate)
+        logger.warning("[router_phase1] max iterations reached "
+                       "(diff_rate=%.4f errors=%d vocab=%d)",
+                       diff_rate, errors, vocab_size)
         return "phase1_done"
+    if not healthy:
+        logger.warning("[router_phase1] iter=%d not healthy "
+                       "(vocab=%d errors=%d) — retrying",
+                       iteration, vocab_size, errors)
     return "phase1_next_iter"
 
 
@@ -187,14 +209,21 @@ def phase1_done_node(state: GlobalState) -> dict[str, Any]:
     actions = state.get("actions", [])
     logger.info("[phase1_done] guards=%d actions=%d", len(guards), len(actions))
 
-    try:
-        out_path = config.OUTPUT_PATH / "Global_LSG_Spec_Enriched.yaml"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump({"guards": guards, "actions": actions},
-                           f, sort_keys=False, allow_unicode=True)
-    except Exception:
-        logger.warning("[phase1_done] failed to write vocab yaml", exc_info=True)
+    # R2: do NOT write an empty Global spec. If phase1 produced no vocabulary
+    # (every sub-agent failed), leave the file for the end-of-pipeline writer
+    # (write_enriched_spec, R3) to rebuild from the LSGs phase2 actually
+    # produced. Writing guards: []/actions: [] here would mask the failure.
+    if guards or actions:
+        try:
+            out_path = config.OUTPUT_PATH / "Global_LSG_Spec_Enriched.yaml"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump({"guards": guards, "actions": actions},
+                               f, sort_keys=False, allow_unicode=True)
+        except Exception:
+            logger.warning("[phase1_done] failed to write vocab yaml", exc_info=True)
+    else:
+        logger.warning("[phase1_done] empty vocabulary — skipping Global spec write")
 
     return {
         "converged_phase1": True,
@@ -204,30 +233,46 @@ def phase1_done_node(state: GlobalState) -> dict[str, Any]:
 
 
 def workflow_scheduler_node(state: GlobalState) -> dict[str, Any]:
-    completed = state.get("completed_workflows", [])
-    for wf_id in WORKFLOW_IDS:
-        if wf_id not in completed:
-            logger.info("[workflow_scheduler] next=%s completed=%s", wf_id, completed)
-            return {
-                "current_workflow": wf_id,
-                "phase2_iteration": 1,
-                "a_class_count": -1,
-                "prev_a_class_count": -1,
-                "wf_iteration_history": [],
-                "b_class_focus": False,
-                "b_class_focus_iteration": 0,
-                "prev_b_class_count": -1,
-                "diff_report": {},
-                "a_class_feedback": [],
-                "sparsity_hints": [],
-            }
+    """Domain scheduler: iterate all domains (7 workflows + subsystems).
 
-    logger.info("[workflow_scheduler] all %d workflows done", len(WORKFLOW_IDS))
-    return {"current_workflow": ""}
+    Workflow domains run the FSM track; subsystem domains run the parameter
+    track. Completion is tracked in ``completed_domains``.
+    """
+    completed = state.get("completed_domains", []) or []
+    for dom in config.all_domains():
+        if dom.id in completed:
+            continue
+        logger.info("[domain_scheduler] next=%s kind=%s completed=%s",
+                    dom.id, dom.kind, completed)
+        result = {
+            "current_domain": dom.id,
+            "phase2_iteration": 1,
+            "a_class_count": -1,
+            "prev_a_class_count": -1,
+            "wf_iteration_history": [],
+            "b_class_focus": False,
+            "b_class_focus_iteration": 0,
+            "prev_b_class_count": -1,
+            "diff_report": {},
+            "a_class_feedback": [],
+            "sparsity_hints": [],
+        }
+        # Workflow domains drive the FSM track via current_workflow.
+        result["current_workflow"] = dom.id if dom.kind == "workflow" else ""
+        return result
+
+    logger.info("[domain_scheduler] all %d domains done", len(config.all_domains()))
+    return {"current_domain": "", "current_workflow": ""}
 
 
 def route_after_workflow_scheduler(state: GlobalState) -> str:
-    return "phase2_fanout" if state.get("current_workflow") else "final_aggregate"
+    dom_id = state.get("current_domain", "")
+    if not dom_id:
+        return "final_aggregate"
+    dom = config.get_domain(dom_id)
+    if dom is not None and dom.kind == "subsystem":
+        return "param_fanout"
+    return "phase2_fanout"
 
 
 def phase2_sub_agent_node(state: GlobalState) -> dict[str, Any]:
@@ -401,6 +446,7 @@ def phase2_wf_converged_node(state: GlobalState) -> dict[str, Any]:
     logger.info("[phase2_wf_converged] wf=%s", wf)
     return {
         "completed_workflows": [wf],
+        "completed_domains": [wf],
         "workflow_diff_reports": {wf: state.get("diff_report", {})},
         "convergence_reason": _last_p2_convergence_reason,
     }
@@ -411,9 +457,37 @@ def phase2_wf_force_stop_node(state: GlobalState) -> dict[str, Any]:
     logger.warning("[phase2_wf_force_stop] wf=%s", wf)
     return {
         "completed_workflows": [wf],
+        "completed_domains": [wf],
         "workflow_diff_reports": {wf: state.get("diff_report", {})},
         "convergence_reason": _last_p2_convergence_reason,
     }
+
+
+# ── Parameter / behavior-divergence track (subsystem domains) ────────────────
+
+
+def param_fanout(state: GlobalState) -> list[Send]:
+    """Fan out to one parameter sub-agent per client."""
+    return [
+        Send("param_sub_agent", {**state, "_client_name": client})
+        for client in CLIENT_NAMES
+    ]
+
+
+def param_sub_agent_node(state: GlobalState) -> dict[str, Any]:
+    from agents.param_sub_agent import build_param_sub_agent
+    client_name = state.get("_client_name", "")
+    cbs = _make_callbacks(2, 0, f"param_sub_{client_name}")
+    return build_param_sub_agent(client_name, llm=_get_llm(), callbacks=cbs)(state)
+
+
+def param_main_agent_node(state: GlobalState) -> dict[str, Any]:
+    from agents.param_main_agent import build_param_main_agent
+    result = build_param_main_agent(llm=_get_llm())(state)
+    dom_id = state.get("current_domain", "")
+    result["completed_domains"] = [dom_id]
+    logger.info("[param_main] domain=%s sealed", dom_id)
+    return result
 
 
 # ── Phase 2.5: Scenario Scan ─────────────────────────────────────────────────
@@ -599,16 +673,19 @@ def final_aggregate_node(state: GlobalState) -> dict[str, Any]:
 
     n_confirmed = sum(1 for d in all_b if d.get("verification_status") == "CONFIRMED")
     n_downgraded = sum(1 for d in all_b if d.get("verification_status") == "DOWNGRADED")
+    # Parameter / behavior divergences from subsystem domains.
+    all_param = list(state.get("parameter_divergences", []))
     logger.info(
-        "[final_aggregate] wfs=%d A=%d B=%d (confirmed=%d downgraded=%d) total=%d rate=%.4f",
+        "[final_aggregate] wfs=%d A=%d B=%d (confirmed=%d downgraded=%d) total=%d rate=%.4f param_divs=%d",
         len(wf_reports), len(all_a), len(all_b), n_confirmed, n_downgraded,
-        total, logic_diff_rate,
+        total, logic_diff_rate, len(all_param),
     )
 
     return {
         "diff_report": {
             "a_class_diffs": all_a,
             "b_class_diffs": all_b,
+            "parameter_divergences": all_param,
             "logic_diff_rate": logic_diff_rate,
             "total_transitions": total,
         },
@@ -646,6 +723,9 @@ def build_graph() -> StateGraph:
     g.add_node("phase3_verify_main", phase3_verify_main_node)
     g.add_node("phase3_wf_verified", phase3_wf_verified_node)
     g.add_node("final_aggregate", final_aggregate_node)
+    g.add_node("param_fanout", lambda _s: {})
+    g.add_node("param_sub_agent", param_sub_agent_node)
+    g.add_node("param_main_agent", param_main_agent_node)
 
     g.set_entry_point("preprocess")
 
@@ -664,8 +744,12 @@ def build_graph() -> StateGraph:
 
     g.add_conditional_edges(
         "workflow_scheduler", route_after_workflow_scheduler,
-        {"phase2_fanout": "phase2_fanout", "final_aggregate": "final_aggregate"},
+        {"phase2_fanout": "phase2_fanout", "param_fanout": "param_fanout",
+         "final_aggregate": "final_aggregate"},
     )
+    g.add_conditional_edges("param_fanout", param_fanout, ["param_sub_agent"])
+    g.add_edge("param_sub_agent", "param_main_agent")
+    g.add_edge("param_main_agent", "workflow_scheduler")
     g.add_conditional_edges("phase2_fanout", phase2_fanout, ["phase2_sub_agent"])
     g.add_edge("phase2_sub_agent", "phase2_main_agent")
     g.add_conditional_edges(

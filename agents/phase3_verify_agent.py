@@ -18,11 +18,12 @@ import logging
 from pathlib import Path
 from typing import Any, Literal
 
-from jinja2 import Template
 from pydantic import BaseModel, Field
 
-from config import CLIENT_NAMES, VERIFY_SEARCH_TOP_K
-from utils import invoke_with_retry
+from config import VERIFY_SEARCH_TOP_K
+
+from agents._prompts import load_template
+from agents._llm import invoke_structured
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,8 @@ _SUB_PROMPT_PATH = Path(__file__).parent / "prompts" / "phase3_verify_sub.j2"
 _MAIN_PROMPT_PATH = Path(__file__).parent / "prompts" / "phase3_verify_main.j2"
 
 
-def _load_template(path: Path) -> Template:
-    return Template(path.read_text(encoding="utf-8"))
+def _load_template(path: Path):
+    return load_template(path)
 
 
 # ── Pydantic schemas for structured LLM output ─────────────────────────
@@ -285,9 +286,8 @@ def build_phase3_verify_sub_agent(client_name: str, llm=None, callbacks=None):
                 evidence_per_diff=all_evidence,
             )
             try:
-                chain = llm.with_structured_output(VerifySubResult)
-                result: VerifySubResult = invoke_with_retry(
-                    chain, prompt,
+                result = invoke_structured(
+                    llm, VerifySubResult, prompt,
                     label=f"phase3_verify_sub/{client_name}/{current_wf}",
                     callbacks=callbacks,
                 )
@@ -423,12 +423,10 @@ def build_phase3_verify_main_agent(llm=None, callbacks=None):
                 workflow_id=current_wf,
                 b_diffs=b_diffs,
                 evidence_map=evidence_map,
-                client_names=CLIENT_NAMES,
             )
             try:
-                chain = llm.with_structured_output(VerifyMainResult)
-                result: VerifyMainResult = invoke_with_retry(
-                    chain, prompt,
+                result = invoke_structured(
+                    llm, VerifyMainResult, prompt,
                     label=f"phase3_verify_main/{current_wf}",
                     callbacks=callbacks,
                 )

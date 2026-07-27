@@ -26,22 +26,92 @@ logger = logging.getLogger(__name__)
 
 
 def write_enriched_spec(state: dict[str, Any]) -> Path:
-    """Write the enriched global vocabulary (Phase 1 output)."""
+    """Write the enriched global vocabulary (Phase 1 output).
+
+    R3: if phase1 produced no vocabulary (guards/actions empty — e.g. every
+    sub-agent failed on out-of-credit 429s), rebuild it by harvesting the
+    guard/action names actually referenced in the phase2 client LSGs. This
+    guarantees the Global spec is never empty and downstream consumers see the
+    vocabulary the LSGs actually used. It is also called at pipeline end so any
+    names phase2 invented make it back into the global vocab.
+    """
     config.OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
     path = config.OUTPUT_PATH / "Global_LSG_Spec_Enriched.yaml"
+
+    guards = list(state.get("guards", []))
+    actions = list(state.get("actions", []))
+
+    if not guards and not actions:
+        client_lsgs = state.get("client_lsgs", {}) or {}
+        ref_g: set[str] = set()
+        ref_a: set[str] = set()
+        for lsg in client_lsgs.values():
+            if not isinstance(lsg, dict):
+                continue
+            g, a = _collect_referenced_names(lsg.get("workflows", []) or [])
+            ref_g |= g
+            ref_a |= a
+        if ref_g or ref_a:
+            guards = [{"name": n, "category": "discovered", "description": ""}
+                      for n in sorted(ref_g)]
+            actions = [{"name": n, "category": "discovered", "description": ""}
+                       for n in sorted(ref_a)]
+            logger.info("[write_enriched_spec] global vocab was empty — harvested "
+                        "%d guards / %d actions from client LSGs",
+                        len(guards), len(actions))
 
     spec = {
         "version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "guards": list(state.get("guards", [])),
-        "actions": list(state.get("actions", [])),
+        "guards": guards,
+        "actions": actions,
     }
 
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(spec, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
-    logger.info("[write_enriched_spec] → %s", path)
+    logger.info("[write_enriched_spec] → %s (guards=%d actions=%d)",
+                path, len(guards), len(actions))
     return path
+
+
+def write_parameter_divergence_report(state: dict[str, Any]) -> Path | None:
+    """Write the parameter / behavior-divergence report (subsystem domains).
+
+    Returns None (and writes nothing) when there are no divergences.
+    """
+    diff_report = state.get("diff_report", {}) or {}
+    divs = (diff_report.get("parameter_divergences")
+            or state.get("parameter_divergences") or [])
+    if not divs:
+        logger.info("[write_parameter_divergence_report] no divergences — skipping")
+        return None
+    config.OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+    md = config.OUTPUT_PATH / "Parameter_Divergence_Report.md"
+    lines = ["# Parameter & Behavior Divergence Report", "",
+             f"Total divergences: {len(divs)}", ""]
+    for d in divs:
+        lines.append(f"## {d.get('name', '?')}  (`{d.get('aspect_id', '')}`)")
+        lines.append(
+            f"- domain: `{d.get('domain_id', '')}`  "
+            f"type: `{d.get('divergence_type', '')}`  "
+            f"severity: **{d.get('severity', '')}**"
+        )
+        if d.get("description"):
+            lines.append(f"- {d['description']}")
+        vg = d.get("value_groups", {}) or {}
+        if vg:
+            lines.append("- value groups:")
+            for k, cs in vg.items():
+                lines.append(f"    - `{k}` <- {', '.join(cs)}")
+        dev = d.get("deviating_clients", []) or []
+        if dev:
+            lines.append(f"- deviating clients: {', '.join(dev)}")
+        lines.append("")
+    md.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("[write_parameter_divergence_report] -> %s (%d divergences)",
+                md, len(divs))
+    return md
 
 
 def write_client_lsg(client_name: str, lsg: dict[str, Any], final: bool = False) -> Path:

@@ -16,9 +16,9 @@ OSCILLATION_WINDOW: int = 3
 OSCILLATION_BAND: int = 2
 
 # Phase 2 stage 2: B-class discovery
-MAX_ITER_B_CLASS: int = 3
-B_CLASS_STABLE_WINDOW: int = 2
-B_CLASS_CHANGE_THRESHOLD: int = 1
+MAX_ITER_B_CLASS: int = 5      # F9: was 3 — new-discovery capped too early
+B_CLASS_STABLE_WINDOW: int = 3  # F9: was 2
+B_CLASS_CHANGE_THRESHOLD: int = 0  # F9: was 1 — any change resets stability
 
 # Phase 3: B-class verification
 VERIFY_ENABLED: bool = True
@@ -157,6 +157,142 @@ ENTRY_POINT_PATH_MARKERS: dict[str, list[str]] = {
         "executionengine", "/engine/", "engine_api",
     ],
 }
+
+# ── Analysis domains ─────────────────────────────────────────────────────────
+# Generalises "workflow" beyond the 7 consensus workflows. Subsystem domains
+# (networking / p2p) are first-class analysis targets with their own entry-point
+# heuristics and retrieval config. Workflow domains → FSM extraction track;
+# subsystem domains → parameter / behavior-divergence track.
+@dataclass
+class Domain:
+    id: str
+    name: str
+    kind: str = "workflow"            # "workflow" | "subsystem"
+    description: str = ""
+    entry_keywords: list[str] = field(default_factory=list)
+    entry_path_markers: list[str] = field(default_factory=list)
+    retrieval_queries: list[str] = field(default_factory=list)
+    max_call_depth: int = 5
+    max_snippets: int = 40
+    max_total_chars: int = 32_000
+    snippet_chars: int | None = None  # None = budget-aware full bodies
+    top_k_per_query: int = 6
+    extract_fsm: bool = True
+    extract_parameters: bool = False
+
+
+def _build_workflow_domains() -> list[Domain]:
+    doms: list[Domain] = []
+    for wf in WORKFLOW_IDS:
+        doms.append(Domain(
+            id=wf,
+            name=wf.replace("_", " ").title(),
+            kind="workflow",
+            entry_keywords=list(ENTRY_POINT_KEYWORDS.get(wf, [])),
+            entry_path_markers=list(ENTRY_POINT_PATH_MARKERS.get(wf, [])),
+        ))
+    return doms
+
+
+# Subsystem domains — networking / p2p. Entry-point seeds are grounded in the
+# file paths cited in discv5.md / beacon_peer.md. extract_parameters=True routes
+# them through the parameter / behavior-divergence track (not the FSM track).
+SUBSYSTEM_DOMAINS: list[Domain] = [
+    Domain(
+        id="discv5",
+        name="discv5 Discovery",
+        kind="subsystem",
+        description="UDP packet handling & rate limiting in the discovery v5 layer",
+        extract_fsm=False, extract_parameters=True, max_call_depth=8,
+        entry_keywords=[
+            "ratelimit", "ratedlim", "discv5", "readudp", "recvudp",
+            "handlepacket", "onpacket", "initialpass", "finalpass", "gcra",
+            "filter", "banip",
+        ],
+        entry_path_markers=[
+            "p2p/discovery", "discv5", "discovery/", "v5wire",
+            "rate_limit", "ratelimit",
+        ],
+        retrieval_queries=[
+            "UDP packet read receive rate limit throttle",
+            "discv5 rate limiter per-IP GCRA burst total node",
+            "packet filter ban IP duration ban_duration",
+            "RateLimiterBuilder total_n_every node_n_every ip_n_every",
+            "discv5 discovery service recv packet max size 1280",
+        ],
+    ),
+    Domain(
+        id="peer_scoring",
+        name="Peer Scoring",
+        kind="subsystem",
+        description="libp2p gossipsub + application-layer peer scoring & reputation",
+        extract_fsm=False, extract_parameters=True, max_call_depth=8,
+        entry_keywords=[
+            "peerscore", "scorepeer", "reputation", "peerdb", "scorer",
+            "isbadpeer", "gossipsubscore", "subnetscorer", "peeraction",
+            "recomputescore", "worstconnectedpeers", "pruneexcesspeers",
+            "applyreconnectioncooldown", "banpeer", "disconnectpeer",
+        ],
+        entry_path_markers=[
+            "p2p/peers/scorers", "peer_manager/peerdb", "peerdb/score",
+            "gossipsub_scoring_parameters", "networking/eth2/gossip/subnets",
+            "networking/p2p/reputation", "network/peers/score",
+            "network/gossip/scoringparameters", "peers/score/store",
+        ],
+        retrieval_queries=[
+            "peer score weighted sum component weight gossip bad status",
+            "peer score gossipsub threshold ban disconnect forced",
+            "peer reputation penalty reward adjust large small",
+            "peer bad responses max threshold isBadPeer gossipThreshold",
+            "peer score recompute composite halflife decay PeerAction",
+            "subnet scorer unique coverage committee 1000",
+            "prune excess peers worst score sort disconnect",
+        ],
+    ),
+    Domain(
+        id="peer_management",
+        name="Peer Management",
+        kind="subsystem",
+        description="Connection limits, pruning, reconnection cooldown",
+        extract_fsm=False, extract_parameters=True, max_call_depth=7,
+        entry_keywords=[
+            "peermanager", "peerconnection", "connectpeer", "disconnectpeer",
+            "prune", "reconnect", "connectionlimit", "maxpeers", "targetpeers",
+        ],
+        entry_path_markers=[
+            "peer_manager", "p2p/peers", "network/peers",
+        ],
+        retrieval_queries=[
+            "peer connection limit target max peers prune excess",
+            "peer reconnection cooldown goodbye reason backoff",
+        ],
+    ),
+]
+
+# WORKFLOW_IDS remains the canonical workflow list; this is the semantic alias.
+WORKFLOW_DOMAIN_IDS: list[str] = list(WORKFLOW_IDS)
+
+_DOMAIN_INDEX: dict[str, Domain] = {
+    d.id: d for d in (_build_workflow_domains() + SUBSYSTEM_DOMAINS)
+}
+
+
+def get_domain(domain_id: str) -> Domain | None:
+    return _DOMAIN_INDEX.get(domain_id)
+
+
+def all_domains() -> list[Domain]:
+    """All analysis domains: 7 workflows first, then subsystems."""
+    return list(_DOMAIN_INDEX.values())
+
+
+def workflow_domains() -> list[Domain]:
+    return [d for d in _DOMAIN_INDEX.values() if d.kind == "workflow"]
+
+
+def subsystem_domains() -> list[Domain]:
+    return [d for d in _DOMAIN_INDEX.values() if d.kind == "subsystem"]
+
 
 # ── Fault scenarios for Phase 2.5 scenario scan ─────────────────────────────
 #

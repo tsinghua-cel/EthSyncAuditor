@@ -59,8 +59,35 @@ def invoke_with_retry(chain: Any, prompt: Any, *,
     raise last_exc
 
 
+def _balance_by_category(details: list[dict], budget: int) -> list[dict]:
+    """Keep up to *budget* details, round-robin across categories so no single
+    category monopolises the slot (F7)."""
+    if len(details) <= budget:
+        return details
+    by_cat: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for d in details:
+        c = d.get("category", "uncategorized")
+        if c not in by_cat:
+            by_cat[c] = []
+            order.append(c)
+        by_cat[c].append(d)
+    kept: list[dict] = []
+    while len(kept) < budget:
+        progressed = False
+        for c in order:
+            if by_cat[c]:
+                kept.append(by_cat[c].pop(0))
+                progressed = True
+                if len(kept) >= budget:
+                    break
+        if not progressed:
+            break
+    return kept[:budget]
+
+
 def summarize_vocab_for_prompt(guards: list[dict], actions: list[dict],
-                               max_full_entries: int = 80) -> dict[str, Any]:
+                               max_full_entries: int = 120) -> dict[str, Any]:
     """Build the vocabulary view consumed by ``phase2_sub.j2``.
 
     Returned shape::
@@ -98,9 +125,12 @@ def summarize_vocab_for_prompt(guards: list[dict], actions: list[dict],
     g_details = _detail(guards)
     a_details = _detail(actions)
     if len(g_details) + len(a_details) > max_full_entries:
-        keep = max(1, max_full_entries // 2)
-        g_details = g_details[:keep]
-        a_details = a_details[:keep]
+        # F7: was a pure head-cut (first N only). Sample category-balanced so
+        # every category keeps representation instead of the earliest-inserted
+        # entries monopolising the budget.
+        half = max(1, max_full_entries // 2)
+        g_details = _balance_by_category(g_details, half)
+        a_details = _balance_by_category(a_details, half)
 
     return {
         "total_guards": len(guards),
@@ -113,12 +143,12 @@ def summarize_vocab_for_prompt(guards: list[dict], actions: list[dict],
 
 
 def compute_lsg_sparsity(client_lsgs: dict[str, dict],
-                         min_states: int = 3,
-                         min_transitions: int = 4) -> list[dict]:
+                         min_states: int = 5,
+                         min_transitions: int = 6) -> list[dict]:
     """Return a hint per (client, workflow) when the LSG looks sparse.
 
-    A workflow is flagged when it has fewer than *min_states* states or
-    fewer than *min_transitions* transitions.
+    F8: defaults raised (were 3/4 — a 3-state/4-transition skeleton passed as
+    "converged"). Also flags non-terminal states that have zero transitions.
     """
     hints: list[dict] = []
     for client, lsg in client_lsgs.items():
@@ -129,12 +159,18 @@ def compute_lsg_sparsity(client_lsgs: dict[str, dict],
             states = wf.get("states", []) or []
             n_states = len(states)
             n_trans = sum(len(s.get("transitions", []) or []) for s in states)
-            if n_states < min_states or n_trans < min_transitions:
+            dead_ends = sum(
+                1 for s in states
+                if (s.get("category") not in ("terminal", "done"))
+                and not (s.get("transitions") or [])
+            )
+            if n_states < min_states or n_trans < min_transitions or dead_ends:
                 hints.append({
                     "client": client,
                     "workflow_id": wf_id,
                     "states": n_states,
                     "transitions": n_trans,
+                    "dead_end_states": dead_ends,
                 })
     return hints
 
