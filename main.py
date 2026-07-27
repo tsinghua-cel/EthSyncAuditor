@@ -18,6 +18,8 @@ from config import (
     DEEPSEEK_MODEL,
     GEMINI_BASE_URL,
     GEMINI_MODEL,
+    GLM_BASE_URL,
+    GLM_MODEL,
     LLM_MODEL,
     LLM_PROVIDER,
     OUTPUT_PATH,
@@ -51,12 +53,13 @@ def _proxy_url() -> str | None:
             or os.environ.get("ALL_PROXY"))
 
 
-class _DeepSeekStructuredOutputWrapper:
+class _OpenAICompatibleStructuredOutputWrapper:
     """Wraps ChatOpenAI so that ``with_structured_output`` defaults to
-    ``method="function_calling"``, which DeepSeek's API supports (unlike
-    the ``json_schema`` mode, and unlike ``json_mode`` which requires the
-    word "json" in every prompt).  All other attribute accesses are
-    transparently delegated to the underlying ChatOpenAI instance."""
+    ``method="function_calling"``, which OpenAI-compatible providers
+    (DeepSeek, GLM/Zhipu) support — unlike the ``json_schema`` mode, and
+    unlike ``json_mode`` which requires the word "json" in every prompt.
+    All other attribute accesses are transparently delegated to the
+    underlying ChatOpenAI instance."""
 
     def __init__(self, chat_openai: Any) -> None:
         self._llm = chat_openai
@@ -119,7 +122,36 @@ def _init_llm(model_name: str, *, provider: str, base_url: str) -> Any:
         # We wrap the LLM to force method="function_calling" instead, which
         # uses tool-calling — fully supported by DeepSeek once thinking is
         # disabled.
-        return _DeepSeekStructuredOutputWrapper(llm)
+        return _OpenAICompatibleStructuredOutputWrapper(llm)
+
+    if provider == "glm":
+        try:
+            from langchain_openai import ChatOpenAI  # type: ignore[import-untyped]
+        except ImportError:
+            logger.warning("langchain-openai not installed; falling back to mock")
+            return None
+        if not os.environ.get("GLM_API_KEY"):
+            logger.warning("GLM_API_KEY not set; falling back to mock")
+            return None
+
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "api_key": os.environ["GLM_API_KEY"],
+            "base_url": base_url or os.environ.get("GLM_BASE_URL", ""),
+            # Zhipu GLM's chat model has thinking enabled by default, but
+            # thinking mode conflicts with tool_choice (used by
+            # function_calling structured output).  Disable it explicitly.
+            "model_kwargs": {"extra_body": {"thinking": {"type": "disabled"}}},
+        }
+        logger.info("Initializing GLM LLM model=%s", model_name)
+        llm = ChatOpenAI(**kwargs)
+        # GLM does not support OpenAI's json_schema response_format
+        # (which langchain-openai uses by default in with_structured_output),
+        # and json_mode requires the word "json" to appear in every prompt.
+        # We wrap the LLM to force method="function_calling" instead, which
+        # uses tool-calling — fully supported by GLM once thinking is
+        # disabled.
+        return _OpenAICompatibleStructuredOutputWrapper(llm)
 
     # anthropic (default)
     try:
@@ -142,7 +174,7 @@ def _init_llm(model_name: str, *, provider: str, base_url: str) -> Any:
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="EthSyncAuditor — LSG extraction & comparison")
     p.add_argument("--mock", action="store_true", help="Run with mock agents (no LLM)")
-    p.add_argument("--provider", choices=["anthropic", "gemini", "deepseek"], default=None,
+    p.add_argument("--provider", choices=["anthropic", "gemini", "deepseek", "glm"], default=None,
                    help="LLM provider (default: config.LLM_PROVIDER)")
     p.add_argument("--resume", action="store_true",
                    help="Resume from the latest checkpoint")
@@ -160,6 +192,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Custom API base URL for Gemini")
     p.add_argument("--deepseek-base-url", default=None,
                    help="Custom API base URL for DeepSeek")
+    p.add_argument("--glm-base-url", default=None,
+                   help="Custom API base URL for GLM/Zhipu")
     p.add_argument("--skip-verify", action="store_true",
                    help="Skip Phase 3 B-class verification")
     return p
@@ -234,6 +268,9 @@ def main() -> None:
         elif provider == "deepseek":
             model_name = DEEPSEEK_MODEL
             base_url = args.deepseek_base_url or DEEPSEEK_BASE_URL
+        elif provider == "glm":
+            model_name = GLM_MODEL
+            base_url = args.glm_base_url or GLM_BASE_URL
         else:
             model_name = LLM_MODEL
             base_url = args.anthropic_base_url or ANTHROPIC_BASE_URL

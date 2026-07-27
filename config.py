@@ -297,13 +297,15 @@ EMBEDDING_MODELS: list[str] = [
 ]
 
 # LLM provider & model
-LLM_PROVIDER: str = "anthropic"          # "anthropic" | "gemini" | "deepseek"
+LLM_PROVIDER: str = "anthropic"          # "anthropic" | "gemini" | "deepseek" | "glm"
 LLM_MODEL: str = "claude-opus-4-6"
 GEMINI_MODEL: str = "gemini-3.5-flash"
 DEEPSEEK_MODEL: str = "deepseek-v4-pro"
+GLM_MODEL: str = "glm-5.2"
 
 # API base URLs (empty = provider default; CLI / env vars override)
 ANTHROPIC_BASE_URL: str = ""
 GEMINI_BASE_URL: str = ""
 DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+GLM_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4/"
 
