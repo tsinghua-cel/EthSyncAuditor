@@ -18,10 +18,13 @@ def invoke_structured(
     *,
     label: str,
     callbacks: Any = None,
+    max_retries: int = 3,
 ) -> Any:
     """Bind *schema* for structured output, then invoke with retry/backoff.
 
     Returns the validated pydantic *schema* instance.
     """
     chain = llm.with_structured_output(schema)
-    return invoke_with_retry(chain, prompt, label=label, callbacks=callbacks)
+    return invoke_with_retry(
+        chain, prompt, label=label, callbacks=callbacks, max_retries=max_retries,
+    )

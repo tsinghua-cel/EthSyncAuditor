@@ -144,7 +144,10 @@ class DiffItem(BaseModel):
     involved_clients: list[str] = Field(default_factory=list)
     deviating_clients: list[str] = Field(default_factory=list)
     security_note: str = ""
-    evidence: dict[str, Evidence | None] = Field(default_factory=dict)
+    # Tolerant on purpose: some providers (GLM) emit evidence as a flat
+    # {file,function} dict instead of the {client: Evidence} mapping. Real
+    # evidence is re-grounded in Phase 3, so accept any shape here.
+    evidence: dict[str, Any] = Field(default_factory=dict)
 
 
 class DiffReport(BaseModel):

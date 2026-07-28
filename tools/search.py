@@ -41,6 +41,31 @@ class SearchResult:
 
 _bm25_cache: dict[str, dict] = {}
 _callgraph_cache: dict[str, dict] = {}
+_chroma_cache: dict[str, Any] = {}
+_embeddings_singleton: Any = None
+
+
+def _get_embeddings():
+    """Return a process-wide cached HuggingFaceEmbeddings instance.
+
+    Loading the embedding model is expensive (~seconds + GPU/mps memory).
+    Previously _load_chroma re-instantiated it on every search call, leaking
+    memory until the run crashed; cache it once.
+    """
+    global _embeddings_singleton
+    if _embeddings_singleton is not None:
+        return _embeddings_singleton
+    try:
+        try:
+            from langchain_huggingface import HuggingFaceEmbeddings
+        except ImportError:
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+    except ImportError:
+        logger.warning("HuggingFaceEmbeddings not available")
+        return None
+    _embeddings_singleton = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return _embeddings_singleton
+_callgraph_cache: dict[str, dict] = {}
 
 
 def _load_bm25(client_name: str) -> dict | None:
@@ -72,12 +97,10 @@ def _load_callgraph(client_name: str) -> dict | None:
 
 
 def _load_chroma(client_name: str):
-    """Load a Chroma collection for *client_name*."""
+    """Load (and cache) a Chroma collection for *client_name*."""
+    if client_name in _chroma_cache:
+        return _chroma_cache[client_name]
     try:
-        try:
-            from langchain_huggingface import HuggingFaceEmbeddings
-        except ImportError:
-            from langchain_community.embeddings import HuggingFaceEmbeddings
         from langchain_chroma import Chroma
     except ImportError:
         logger.warning("Chroma/langchain deps not available")
@@ -86,12 +109,16 @@ def _load_chroma(client_name: str):
     if not Path(persist_dir).exists():
         logger.warning("Chroma dir not found: %s", persist_dir)
         return None
-    embedding = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    return Chroma(
+    embedding = _get_embeddings()
+    if embedding is None:
+        return None
+    db = Chroma(
         collection_name=client_name,
         persist_directory=persist_dir,
         embedding_function=embedding,
     )
+    _chroma_cache[client_name] = db
+    return db
 
 
 # BM25 search helper

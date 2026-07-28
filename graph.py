@@ -159,7 +159,15 @@ def phase1_main_agent_node(state: GlobalState) -> dict[str, Any]:
     result = build_phase1_main_agent(llm=_get_llm(), callbacks=cbs)(state)
 
     try:
-        save_checkpoint({**state, **result}, phase=1, iteration=iteration)
+        ckpt = {**state, **result}
+        # result's guards/actions are incremental (new this iter); the
+        # _merge_vocab reducer accumulates them at runtime, but {**state,
+        # **result} would clobber the accumulated vocab with just the new
+        # entries and break --resume. Re-merge for the checkpoint.
+        from state import _merge_vocab
+        ckpt["guards"] = _merge_vocab(state.get("guards", []), result.get("guards", []))
+        ckpt["actions"] = _merge_vocab(state.get("actions", []), result.get("actions", []))
+        save_checkpoint(ckpt, phase=1, iteration=iteration)
     except Exception:
         logger.warning("[phase1_main] checkpoint save failed", exc_info=True)
 

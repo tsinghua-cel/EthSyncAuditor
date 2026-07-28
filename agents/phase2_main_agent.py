@@ -354,7 +354,7 @@ def build_phase2_main_agent(llm=None, callbacks=None):
             try:
                 report = invoke_structured(
                     llm, DiffReport, _prompt, label="phase2_main",
-                    callbacks=callbacks,
+                    callbacks=callbacks, max_retries=1,
                 )
                 a_feedback = [d.model_dump() for d in report.a_class_diffs]
                 # Always recompute logic_diff_rate from actual counts — the LLM
