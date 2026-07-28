@@ -17,6 +17,17 @@ durations, decay half-lives, trusted-peer handling, default-enabled flags.
 ```
 {% endfor %}
 
+## Required aspects for this subsystem
+You MUST attempt to extract EACH of the following aspects — use the exact `id`
+slug shown as the aspect `id` — in addition to any other parameters you discover.
+For each, report this client's concrete value/behavior as implemented:
+- if implemented: `value_type: "literal"` (or `"structural"` for an algorithm shape);
+- if this client does NOT implement it at all: `value_type: "absent"`, `value: "absent"`;
+- if the code defines it but never calls/uses it: `value_type: "defined_but_unused"`.
+{% for h in domain.aspect_hints %}
+- **`{{ h.id }}`** — {{ h.desc }}
+{% endfor %}
+
 ## Extraction rules
 1. Extract every distinct parameter/behavior you can **see in the snippets**.
    Each gets a stable `id` slug (lowercase, underscored) that another client

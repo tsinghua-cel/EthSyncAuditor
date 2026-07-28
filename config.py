@@ -172,6 +172,9 @@ class Domain:
     entry_keywords: list[str] = field(default_factory=list)
     entry_path_markers: list[str] = field(default_factory=list)
     retrieval_queries: list[str] = field(default_factory=list)
+    # Aspects the parameter extractor should specifically look for (guided
+    # extraction): [{"id": slug, "desc": what to capture}].
+    aspect_hints: list[dict] = field(default_factory=list)
     max_call_depth: int = 5
     max_snippets: int = 40
     max_total_chars: int = 32_000
@@ -214,11 +217,21 @@ SUBSYSTEM_DOMAINS: list[Domain] = [
             "rate_limit", "ratelimit",
         ],
         retrieval_queries=[
-            "UDP packet read receive rate limit throttle",
-            "discv5 rate limiter per-IP GCRA burst total node",
-            "packet filter ban IP duration ban_duration",
+            "UDP packet read receive rate limit throttle total bytes per second",
+            "discv5 rate limiter per-IP per-node GCRA burst total",
+            "rate limiter default enabled disabled CLI flag config",
             "RateLimiterBuilder total_n_every node_n_every ip_n_every",
-            "discv5 discovery service recv packet max size 1280",
+            "packet filter ban IP duration ban_duration filter_max_bans_per_ip",
+            "discv5 discovery service recv readudp packet max size 1280",
+            "rate_limiter build limit per ip node total",
+        ],
+        aspect_hints=[
+            {"id": "udp_rate_limit_policy",
+             "desc": "How incoming UDP/discv5 packets are rate-limited: total bytes/sec, per-IP, per-node, or none. State the limits and whether it is on by default or needs a CLI flag. If the limiter is defined but never called, say so."},
+            {"id": "rate_limit_default_enabled",
+             "desc": "Whether rate limiting is enabled by default (true) or requires a startup flag (false)."},
+            {"id": "udp_max_packet_size",
+             "desc": "Maximum UDP packet size accepted (e.g. 1280)."},
         ],
     ),
     Domain(
@@ -240,13 +253,35 @@ SUBSYSTEM_DOMAINS: list[Domain] = [
             "network/gossip/scoringparameters", "peers/score/store",
         ],
         retrieval_queries=[
-            "peer score weighted sum component weight gossip bad status",
+            "peer score algorithm weighted sum component gossip bad status block",
             "peer score gossipsub threshold ban disconnect forced",
-            "peer reputation penalty reward adjust large small",
+            "peer reputation penalty reward adjust large small disconnect ban hours",
             "peer bad responses max threshold isBadPeer gossipThreshold",
-            "peer score recompute composite halflife decay PeerAction",
+            "peer score recompute composite PeerAction halflife decay",
             "subnet scorer unique coverage committee 1000",
             "prune excess peers worst score sort disconnect",
+            # app-layer / peerdb targeted (beacon_peer.md paths)
+            "ScoreNoLock scorerWeight badResponses peerStatus gossipScorer blockProvider",
+            "peerdb recompute_score ban forced_disconnect healthy trusted infinity",
+            "ReputationAdjustment LARGE_PENALTY reward DISCONNECT_THRESHOLD ban",
+            "applyReconnectionCooldown goodbye reason cooldown ban freeze duration",
+            "MaxScore trusted peer score value INFINITY 100",
+        ],
+        aspect_hints=[
+            {"id": "scoring_algorithm_shape",
+             "desc": "Overall peer scoring algorithm structure: a weighted sum of components (list them with weights), a set of independent scores, or a composite (reputation + gossipsub*weight)."},
+            {"id": "disconnect_threshold",
+             "desc": "Score threshold at which a peer is force-disconnected."},
+            {"id": "ban_threshold",
+             "desc": "Score threshold at which a peer is banned."},
+            {"id": "ban_cooldown_seconds",
+             "desc": "How long (seconds) a banned peer stays banned/frozen before it can reconnect (e.g. 43200=12h, 1800=30min)."},
+            {"id": "trusted_peer_value",
+             "desc": "Score value assigned to trusted peers (e.g. INFINITY, MAX_SCORE=100)."},
+            {"id": "score_decay_halflife",
+             "desc": "Score decay half-life / interval (e.g. 10 minutes, per epoch, per slot)."},
+            {"id": "gossipsub_bridge_weight",
+             "desc": "How the libp2p gossipsub score is bridged into the app-layer peer score (the multiplier/weight, e.g. 0.0011875)."},
         ],
     ),
     Domain(

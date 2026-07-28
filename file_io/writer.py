@@ -75,23 +75,22 @@ def write_enriched_spec(state: dict[str, Any]) -> Path:
     return path
 
 
-def write_parameter_divergence_report(state: dict[str, Any]) -> Path | None:
-    """Write the parameter / behavior-divergence report (subsystem domains).
-
-    Returns None (and writes nothing) when there are no divergences.
-    """
+def _get_parameter_divergences(state: dict[str, Any]) -> list[dict]:
     diff_report = state.get("diff_report", {}) or {}
-    divs = (diff_report.get("parameter_divergences")
+    return (diff_report.get("parameter_divergences")
             or state.get("parameter_divergences") or [])
-    if not divs:
-        logger.info("[write_parameter_divergence_report] no divergences — skipping")
-        return None
-    config.OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
-    md = config.OUTPUT_PATH / "Parameter_Divergence_Report.md"
-    lines = ["# Parameter & Behavior Divergence Report", "",
-             f"Total divergences: {len(divs)}", ""]
+
+
+def render_parameter_section(divs: list[dict], *, heading_level: int = 2) -> list[str]:
+    """Render parameter divergences as markdown lines (no top-level title).
+
+    heading_level controls depth so the section can nest inside Audit_Diff_Report
+    or stand alone.
+    """
+    h = "#" * heading_level
+    lines = [f"Total parameter / behavior divergences: {len(divs)}", ""]
     for d in divs:
-        lines.append(f"## {d.get('name', '?')}  (`{d.get('aspect_id', '')}`)")
+        lines.append(f"{h} {d.get('name', '?')}  (`{d.get('aspect_id', '')}`)")
         lines.append(
             f"- domain: `{d.get('domain_id', '')}`  "
             f"type: `{d.get('divergence_type', '')}`  "
@@ -108,7 +107,25 @@ def write_parameter_divergence_report(state: dict[str, Any]) -> Path | None:
         if dev:
             lines.append(f"- deviating clients: {', '.join(dev)}")
         lines.append("")
-    md.write_text("\n".join(lines), encoding="utf-8")
+    return lines
+
+
+def write_parameter_divergence_report(state: dict[str, Any]) -> Path | None:
+    """Write a STANDALONE parameter-divergence report.
+
+    The main pipeline folds this section into Audit_Diff_Report.md instead (see
+    write_diff_report). This standalone writer is kept for ad-hoc / param-track
+    -only runs. Returns None when there are no divergences.
+    """
+    divs = _get_parameter_divergences(state)
+    if not divs:
+        logger.info("[write_parameter_divergence_report] no divergences — skipping")
+        return None
+    config.OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+    md = config.OUTPUT_PATH / "Parameter_Divergence_Report.md"
+    body = (["# Parameter & Behavior Divergence Report", ""]
+            + render_parameter_section(divs, heading_level=2))
+    md.write_text("\n".join(body), encoding="utf-8")
     logger.info("[write_parameter_divergence_report] -> %s (%d divergences)",
                 md, len(divs))
     return md
@@ -958,12 +975,20 @@ def write_diff_report(state: dict[str, Any]) -> Path:
             )
         lines.append("")
 
+    # Parameter / behavior divergences (subsystem domains) — folded in so the
+    # audit report is a single file (no separate Parameter_Divergence_Report).
+    param_divs = _get_parameter_divergences(state)
+    if param_divs:
+        lines.append("## Parameter & Behavior Divergences (subsystem domains)")
+        lines.append("")
+        lines.extend(render_parameter_section(param_divs, heading_level=3))
+
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
     logger.info(
-        "[write_diff_report] → %s (%d A-class, %d B-class diffs)",
-        path, len(a_diffs), len(b_diffs),
+        "[write_diff_report] → %s (%d A-class, %d B-class diffs, %d param divergences)",
+        path, len(a_diffs), len(b_diffs), len(param_divs),
     )
     return path
 
