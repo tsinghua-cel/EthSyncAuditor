@@ -352,9 +352,9 @@ class Scenario:
 SCENARIOS: list[Scenario] = [
     Scenario(
         id="sync_stall",
-        name="同步停滞",
-        trigger="同步进程中长时间（N slot）无新区块确认",
-        risk="节点卡在过期分叉，错过最终确定性",
+        name="Sync Stall",
+        trigger="No new blocks confirmed for an extended period (N slots) during sync",
+        risk="Node stalls on a stale fork and misses finality",
         search_queries=[
             "stall detection sync no progress timeout",
             "sync chain reset backoff retry peer rotation",
@@ -365,9 +365,9 @@ SCENARIOS: list[Scenario] = [
     ),
     Scenario(
         id="reorg_during_sync",
-        name="同步中 Reorg",
-        trigger="initial_sync 过程中发生链重组，尤其跨 epoch 边界",
-        risk="sync target 不一致、epoch 边界状态错误",
+        name="Reorg During Sync",
+        trigger="A chain reorganization occurs during initial_sync, especially across an epoch boundary",
+        risk="Inconsistent sync target or incorrect epoch-boundary state",
         search_queries=[
             "reorg during sync reset fork choice finalization",
             "finalized checkpoint changed mid-sync clear caches",
@@ -378,9 +378,9 @@ SCENARIOS: list[Scenario] = [
     ),
     Scenario(
         id="el_invalid_cascade",
-        name="EL INVALID + 错误 latestValidHash",
-        trigger="engine_newPayload 返回 INVALID，latestValidHash 指向错误祖先",
-        risk="正确区块被级联作废，节点从错误祖先开始分叉",
+        name="EL INVALID with Incorrect latestValidHash",
+        trigger="engine_newPayload returns INVALID and latestValidHash points to the wrong ancestor",
+        risk="Valid blocks are invalidated in a cascade and the node forks from the wrong ancestor",
         search_queries=[
             "latestValidHash INVALID cascade invalidate descendants rollback",
             "removeInvalidBlockAndState SetOptimisticToInvalid",
@@ -391,9 +391,9 @@ SCENARIOS: list[Scenario] = [
     ),
     Scenario(
         id="el_syncing_stuck",
-        name="EL 持续 SYNCING（optimistic 锁定）",
-        trigger="EL 长期返回 SYNCING，CL 进入永久 optimistic 状态",
-        risk="链安全由 EL 保障失效，攻击者可控制 optimistic head",
+        name="EL Stuck in SYNCING (Optimistic Lock-in)",
+        trigger="EL keeps returning SYNCING and the CL enters a permanent optimistic state",
+        risk="Chain safety guaranteed by the EL is lost; an attacker can control the optimistic head",
         search_queries=[
             "optimistic depth limit exceeded threshold max",
             "optimistic sync stuck indefinitely timeout disconnected",
@@ -405,8 +405,8 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         id="gossip_flood_ddos",
         name="Gossip DDoS",
-        trigger="恶意 peer 大量发送 gossip 消息（区块、attestation、blob）",
-        risk="CPU 耗尽、队列满、正常消息被挤出",
+        trigger="A malicious peer floods gossip messages (blocks, attestations, blobs)",
+        risk="CPU exhaustion, queue saturation, and starvation of legitimate messages",
         search_queries=[
             "rate limit gossip message processing queue bounded",
             "peer score penalty invalid gossip flood reject",
@@ -417,9 +417,9 @@ SCENARIOS: list[Scenario] = [
     ),
     Scenario(
         id="missing_parent_flood",
-        name="大量孤儿区块涌入",
-        trigger="收到大量 parent 未知的区块，可能来自攻击者",
-        risk="orphan 队列无界，内存耗尽；或 peer 被无效惩罚",
+        name="Orphan Block Flood",
+        trigger="A large number of blocks with unknown parents arrive, possibly from an attacker",
+        risk="Unbounded orphan queue causes memory exhaustion, or peers are penalized spuriously",
         search_queries=[
             "orphan block unknown parent queue bounded max",
             "missing parent request by root limit cache evict",
@@ -430,9 +430,9 @@ SCENARIOS: list[Scenario] = [
     ),
     Scenario(
         id="slashing_sign_order",
-        name="签名与 slashing 检查顺序",
-        trigger="验证者签名操作与 slashing DB 检查的时序关系",
-        risk="崩溃恢复时产生双重投票/提案，验证者被 slash",
+        name="Signing vs. Slashing-Check Ordering",
+        trigger="The ordering between a validator's signing operation and the slashing-DB check",
+        risk="On crash recovery a validator double-votes/double-proposes and gets slashed",
         search_queries=[
             "slashing protection check before sign attestation block",
             "maySign checkAndInsert slashingDB BLS signature order",
@@ -443,9 +443,9 @@ SCENARIOS: list[Scenario] = [
     ),
     Scenario(
         id="checkpoint_ws_violation",
-        name="Checkpoint 弱主观性违规",
-        trigger="checkpoint sync 使用过期（超出 WS 窗口）的 checkpoint",
-        risk="节点从恶意链 bootstrap，无法感知真实最终确定性",
+        name="Checkpoint Weak-Subjectivity Violation",
+        trigger="Checkpoint sync uses a stale checkpoint outside the weak-subjectivity window",
+        risk="The node bootstraps from a malicious chain and cannot perceive true finality",
         search_queries=[
             "weak subjectivity period validation checkpoint epoch boundary",
             "WSCheckpoint isWithinWSPeriod validateAnchor too old",
@@ -469,7 +469,7 @@ EMBEDDING_MODELS: list[str] = [
 
 # LLM provider & model
 LLM_PROVIDER: str = "anthropic"          # "anthropic" | "gemini" | "deepseek" | "glm"
-LLM_MODEL: str = "claude-opus-4-6"
+LLM_MODEL: str = "claude-sonnet-4-6"
 GEMINI_MODEL: str = "gemini-3.5-flash"
 DEEPSEEK_MODEL: str = "deepseek-v4-pro"
 GLM_MODEL: str = "glm-5.2"
