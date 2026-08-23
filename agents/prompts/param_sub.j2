@@ -1,0 +1,50 @@
+You are extracting **implementation parameters and behaviors** from
+{{ client_name }} ({{ language }}) for the **{{ domain.name }}** subsystem.
+
+Subsystem: {{ domain.description }}
+
+Unlike state-machine extraction, you are looking for **constants, thresholds,
+algorithm shapes, and policy decisions** — things that vary across clients but
+do NOT fit a guard/action state transition. Examples for this subsystem:
+rate-limit values, scoring weights, ban/disconnect thresholds, cooldown
+durations, decay half-lives, trusted-peer handling, default-enabled flags.
+
+## Source snippets (the ONLY code you may cite)
+{% for s in snippets %}
+### [{{ s.id }}] `{{ s.file }}` :: `{{ s.function }}` L{{ s.start_line }}–{{ s.end_line }}
+```{{ language }}
+{{ s.code }}
+```
+{% endfor %}
+
+## Required aspects for this subsystem
+You MUST attempt to extract EACH of the following aspects — use the exact `id`
+slug shown as the aspect `id` — in addition to any other parameters you discover.
+For each, report this client's concrete value/behavior as implemented:
+- if implemented: `value_type: "literal"` (or `"structural"` for an algorithm shape);
+- if this client does NOT implement it at all: `value_type: "absent"`, `value: "absent"`;
+- if the code defines it but never calls/uses it: `value_type: "defined_but_unused"`.
+{% for h in domain.aspect_hints %}
+- **`{{ h.id }}`** — {{ h.desc }}
+{% endfor %}
+
+## Extraction rules
+1. Extract every distinct parameter/behavior you can **see in the snippets**.
+   Each gets a stable `id` slug (lowercase, underscored) that another client
+   implementing the same concept would plausibly use — e.g.
+   `udp_rate_limit`, `ban_cooldown_seconds`, `disconnect_threshold`,
+   `trusted_peer_value`, `algorithm_shape`.
+2. `value` is the concrete value/policy as implemented (quote constants;
+   describe algorithms succinctly but precisely, e.g.
+   "composite = reputation + gossipsub*0.0011875").
+3. `value_type`:
+   - `literal` — a concrete constant is present.
+   - `absent` — this client does NOT implement this aspect at all.
+   - `defined_but_unused` — the code defines it but never calls/uses it.
+   - `structural` — an algorithm shape rather than a single number.
+4. `evidence_file`/`evidence_function`/`evidence_lines` MUST point at one of
+   the snippets above (or be empty). Do not invent paths.
+5. If you cannot find an aspect in the snippets, omit it — do not guess.
+
+Return one aspect per row. Be precise about constants; downstream comparison
+groups clients by exact value.

@@ -1,0 +1,394 @@
+{# Phase 2 Sub-Agent prompt — single-workflow extraction #}
+You are an LSG (Logic Synchronization Graph) extraction agent for the **{{ client_name }}** client ({{ language }}).
+Workflow: **{{ workflow_id }}** | Iteration: {{ iteration }}.
+
+## Unified Vocabulary ({{ vocab.total_guards }} guards, {{ vocab.total_actions }} actions)
+
+### Guard Summary ({{ vocab.total_guards }} total)
+{% for cat, names in vocab.guard_summary.items() %}
+- **{{ cat }}** ({{ names | length }}): {{ names | join(', ') }}
+{% endfor %}
+
+### Action Summary ({{ vocab.total_actions }} total)
+{% for cat, names in vocab.action_summary.items() %}
+- **{{ cat }}** ({{ names | length }}): {{ names | join(', ') }}
+{% endfor %}
+
+### Key Guard Details
+{% for g in vocab.guard_details %}
+- **{{ g.name }}** [{{ g.category }}]: {{ g.description }}
+{% endfor %}
+
+### Key Action Details
+{% for a in vocab.action_details %}
+- **{{ a.name }}** [{{ a.category }}]: {{ a.description }}
+{% endfor %}
+
+{% if previous_wf_yaml %}
+## Previous Workflow Version
+
+Below is the {{ workflow_id }} workflow from the {% if iteration > 1 %}previous iteration{% else %}merged baseline{% endif %}.
+**EXPAND and CORRECT** it based on the code snippets below:
+- **ADD** missing states and transitions you find in the snippets.
+- **FIX** incorrect guards, actions, or next_state references where the snippets show different code.
+- **DO NOT** discard existing states/transitions unless a snippet clearly contradicts them.
+- **UPDATE evidence** fields to point at real snippet files — clear any evidence that points to a
+  file NOT in the snippet list below.
+
+```yaml
+{{ previous_wf_yaml }}
+```
+{% endif %}
+
+{% if sparsity_hints %}
+## Sparsity Warnings
+
+{% for h in sparsity_hints %}
+- **{{ h.workflow_id }}**: only {{ h.states }} states, {{ h.transitions }} transitions — expand this workflow!
+{% endfor %}
+{% endif %}
+
+## Your Task
+
+Extract the **complete** state machine for the **{{ workflow_id }}** workflow from {{ client_name }}'s source code.
+Analyze the actual control flow, event handlers, and state transitions — do NOT simply replicate a template.
+Output only this ONE workflow.
+
+{% if workflow_id == "initial_sync" %}
+### initial_sync
+Bulk-download blocks from peers via `BeaconBlocksByRange` RPC. The node selects peers by
+advertised head_slot, pipelines range requests, validates batches (BLS, state transition,
+consensus), applies them to advance fork-choice, and loops until the local head reaches the
+network target slot. Then switches to regular_sync.
+
+🔑 **Critical State Transitions to Extract:**
+- **Blob sidecar fetching (post-Deneb):** Does the client issue `BlobSidecarsByRange` alongside `BeaconBlocksByRange`?
+- **Stall detection & recovery:** Is there a dedicated `stalled` state with timer/backoff?
+- **Reorg during sync:** If a finalized checkpoint changes mid-sync, is there a `ReorgDetected` guard?
+- **Optimistic import:** Can batches be applied without EL validation? What guard controls it?
+- **Peer scoring feedback loop:** On invalid batch, is the peer penalized/banned?
+- **Epoch boundary processing:** Inline or separate step?
+{% if language == "go" %}Entry points: `beacon-chain/sync/initial-sync/`, `blocksFetcher`, FSM in `*Service`{% endif %}
+{% if language == "rust" and client_name == "lighthouse" %}Entry points: `beacon_node/network/src/sync/range_sync/`, `RangeSync`, `SyncingChain`{% endif %}
+{% if language == "rust" and client_name == "grandine" %}Entry points: `fork_choice_control/`, sync manager{% endif %}
+{% if language == "java" %}Entry points: `beacon/sync/`, `ForwardSync`, `SyncManager`, `PeerSync`{% endif %}
+{% if language == "typescript" %}Entry points: `packages/beacon-node/src/sync/range/`, `RangeSync`, `SyncChain`{% endif %}
+{% endif %}
+
+{% if workflow_id == "regular_sync" %}
+### regular_sync
+Maintains chain head via GossipSub. Subscribes to `beacon_block`, `beacon_attestation`,
+`beacon_aggregate_and_proof`, etc. Validates received blocks, imports them, updates fork-choice.
+Handles missing parents via `BeaconBlocksByRoot`. Falls back to range sync if too far behind.
+
+🔑 **Critical State Transitions to Extract:**
+- **Blob sidecar gossip (post-Deneb):** `BlobsAreAvailable` checked before block import?
+- **Chain reorg handling:** Distinct state/action for `ReorgDetected` → `ReorganizeChain`?
+- **Fallback to range sync:** What guard triggers switch back to initial_sync?
+- **Duplicate/late block handling:** `AlreadyKnown` or `BlockIsFromFutureSlot` ordering?
+- **Attestation buffering:** Buffered until referenced block imported?
+- **Proposer boost:** `IsTimelyBlock` guard for fork-choice weight?
+{% if language == "go" %}Entry points: `beacon-chain/sync/`, `receiveBlock`, `receiveAttestation`{% endif %}
+{% if language == "rust" and client_name == "lighthouse" %}Entry points: `beacon_node/network/src/sync/`, `NetworkBeaconProcessor`{% endif %}
+{% if language == "rust" and client_name == "grandine" %}Entry points: `fork_choice_control/`, `eth2_libp2p/`, gossip event loop{% endif %}
+{% if language == "java" %}Entry points: `networking/eth2/src/.../gossip/`, `BlockImporter`, `AttestationManager`{% endif %}
+{% if language == "typescript" %}Entry points: `packages/beacon-node/src/chain/`, gossip handlers{% endif %}
+{% endif %}
+
+{% if workflow_id == "checkpoint_sync" %}
+### checkpoint_sync
+Fast bootstrap from a trusted finalized checkpoint. Fetches finalized state+block, verifies
+state root against weak subjectivity checkpoint, initializes fork-choice from anchor, syncs
+forward to head, then optionally backfills historical blocks toward genesis.
+
+🔑 **Critical State Transitions to Extract:**
+- **Weak subjectivity validation:** Explicit `WeakSubjectivityCheckFailed` guard?
+- **Retry / fallback on source failure:** Retry same source, try alternatives, or abort?
+- **Backfill blob handling (post-Deneb):** Fetch blob sidecars during backfill?
+- **Anchor state initialization:** `InitializeAnchorState` as distinct action?
+- **Forward sync handoff:** Reuse `initial_sync` or separate sub-state-machine?
+- **Backfill completion:** Terminal state for reaching genesis vs data availability boundary?
+{% if language == "go" %}Entry points: `beacon-chain/sync/checkpoint/`, `--checkpoint-sync-url`{% endif %}
+{% if language == "rust" and client_name == "lighthouse" %}Entry points: `beacon_node/src/cli.rs`, `beacon_node/network/src/sync/backfill_sync/`{% endif %}
+{% if language == "rust" and client_name == "grandine" %}Entry points: `grandine/src/`, checkpoint init path{% endif %}
+{% if language == "java" %}Entry points: `beacon/sync/`, `WeakSubjectivitySync`, `CheckpointSync`{% endif %}
+{% if language == "typescript" %}Entry points: `packages/beacon-node/src/sync/`, `--checkpointSyncUrl`, backfill{% endif %}
+{% endif %}
+
+{% if workflow_id == "attestation_generate" %}
+### attestation_generate
+Validator attestation duty: fetch committee assignment, wait until 1/3 into slot (4s), get
+attestation data (source/target/head), build Attestation with committee bit, sign with BLS key
+(slashing protection), publish to attestation subnet.
+
+🔑 **Critical State Transitions to Extract:**
+- **Slashing protection check:** Explicit `AttestationIsNotSlashable` guard BEFORE signing?
+- **Beacon node API failure:** Retry or skip duty?
+- **Target epoch staleness:** Handled between duty fetch and attestation time?
+- **Subnet subscription:** `SubscribeToSubnet` action? Persistent or transient?
+- **Post-Electra attestation format:** Fork-aware guard for EIP-7549?
+{% if language == "go" %}Entry points: `validator/client/attest.go`, `submitAttestation`{% endif %}
+{% if language == "rust" and client_name == "lighthouse" %}Entry points: `validator_client/src/attestation_service.rs`{% endif %}
+{% if language == "rust" and client_name == "grandine" %}Entry points: validator crate, attestation production{% endif %}
+{% if language == "java" %}Entry points: `validator/client/src/.../duties/`, `AttestationProductionDuty`{% endif %}
+{% if language == "typescript" %}Entry points: `packages/validator/src/services/attestation.ts`{% endif %}
+{% endif %}
+
+{% if workflow_id == "block_generate" %}
+### block_generate
+Validator block proposal: fetch proposer duties, call `engine_forkchoiceUpdated` to start EL
+payload building, call `engine_getPayload`, assemble full beacon block (attestations, deposits,
+slashings, sync aggregate, execution payload, blob KZG commitments), sign, broadcast.
+
+🔑 **Critical State Transitions to Extract:**
+- **Builder API vs local payload:** `BuilderBidIsReceivedAndValid` guard?
+- **Blob KZG commitments (post-Deneb):** `GenerateKzgCommitments` / `AttachBlobSidecars`?
+- **Slashing protection for block signing:** `BlockIsNotSlashable` guard?
+- **MEV-boost circuit breaker:** Fallback to local on consecutive builder failures?
+- **Execution payload timeout:** Fallback payload, retry, or skip slot?
+- **Randao reveal:** Separate action or folded into `BuildBlock`?
+{% if language == "go" %}Entry points: `validator/client/propose.go`, beacon-side `proposer.go`{% endif %}
+{% if language == "rust" and client_name == "lighthouse" %}Entry points: `validator_client/src/block_service.rs`, `beacon_node/execution_layer/`{% endif %}
+{% if language == "rust" and client_name == "grandine" %}Entry points: `block_producer/`{% endif %}
+{% if language == "java" %}Entry points: `validator/client/src/.../duties/BlockProductionDuty.java`{% endif %}
+{% if language == "typescript" %}Entry points: `packages/validator/src/services/block.ts`{% endif %}
+{% endif %}
+
+{% if workflow_id == "aggregate" %}
+### aggregate
+Aggregator role: check VRF-based aggregator selection, subscribe to committee attestation subnet,
+wait until 2/3 into slot (8s), collect individual attestations, compute AggregateAndProof, sign,
+publish to global `beacon_aggregate_and_proof` gossip topic.
+
+🔑 **Critical State Transitions to Extract:**
+- **Aggregator selection proof:** `SelectedAsAggregator` guard? Non-selected branch?
+- **Attestation deduplication:** `AttestationDataIsEquivalentForAggregation` guard?
+- **Empty aggregate handling:** Skip or publish empty?
+- **Self-attestation inclusion:** Distinct action?
+- **Continuous vs point-in-time collection:** Self-looping state or single-shot fetch?
+- **Subnet subscription timing:** `SubnetSubscriptionIsActive` guard?
+{% if language == "go" %}Entry points: `validator/client/aggregate.go`, `SubmitAggregateAndProof`{% endif %}
+{% if language == "rust" and client_name == "lighthouse" %}Entry points: `validator_client/src/attestation_service.rs` (aggregation section){% endif %}
+{% if language == "rust" and client_name == "grandine" %}Entry points: aggregation pool, validator event loop{% endif %}
+{% if language == "java" %}Entry points: `validator/client/src/.../duties/AggregationDuty.java`{% endif %}
+{% if language == "typescript" %}Entry points: `packages/validator/src/services/attestation.ts` (combined){% endif %}
+{% endif %}
+
+{% if workflow_id == "execute_layer_relation" %}
+### execute_layer_relation
+CL↔EL via Engine API: (a) `engine_newPayload` sends payload for validation → VALID/INVALID/SYNCING;
+(b) `engine_forkchoiceUpdated` notifies EL of head/safe/finalized; (c) optimistic sync when EL
+is syncing; (d) on INVALID, invalidate block + descendants and rollback.
+
+🔑 **Critical State Transitions to Extract:**
+- **INVALID payload cascade:** Invalidate only block or all descendants? `InvalidateDescendants` action?
+- **SYNCING vs ACCEPTED distinction:** Separate guards or identical treatment?
+- **Optimistic sync depth limit:** `MaxOptimisticDepthReached` guard?
+- **Late/stale payload status:** `PayloadStatusIsStale` guard?
+- **Engine API reconnection:** `ExecutionEngineDisconnected` guard → retry/backoff?
+- **Deneb engine_newPayload v3:** `ValidateBlobVersionedHashes` separate guard?
+- **forkchoiceUpdated with payloadAttributes:** `TriggerPayloadBuilding` gated on `HasProposerDutyNextSlot`?
+{% if language == "go" %}Entry points: `beacon-chain/execution/`, `notifyNewPayload`, `notifyForkchoiceUpdate`{% endif %}
+{% if language == "rust" and client_name == "lighthouse" %}Entry points: `beacon_node/execution_layer/src/`, `notify_new_payload`{% endif %}
+{% if language == "rust" and client_name == "grandine" %}Entry points: `execution_engine/`, `fork_choice_control/`{% endif %}
+{% if language == "java" %}Entry points: `ethereum/executionlayer/src/`, `ExecutionLayerManager`{% endif %}
+{% if language == "typescript" %}Entry points: `packages/beacon-node/src/execution/engine/`{% endif %}
+{% endif %}
+
+### IMPORTANT: Code-Driven State Discovery
+
+Your state machine MUST reflect the **actual implementation** in {{ client_name }}'s source code.
+Do NOT copy or force-fit skeleton examples from the LSG Spec.
+
+- **Derive states from code**: Read actual control-flow, event loops, match arms, switch cases.
+- **Name states descriptively**: `<workflow>.<phase>` where `<phase>` reflects what the code does.
+- **Completeness over conformity**: If {{ client_name }} has a unique step, include it.
+- **Evidence**: Set `evidence.file` and `evidence.function` **only to values shown in the
+  snippets above**. If a transition is not directly visible in a snippet, leave evidence null.
+  Do NOT invent plausible-looking file paths — null is correct, invented paths are wrong.
+
+### ⚠️ ERROR PATH EXTRACTION (required, not optional)
+
+**Error handling transitions are as important as the happy path.**
+For each stage of the workflow, look for transitions that represent:
+
+1. **Failure detection**: What condition indicates the operation failed?
+   (e.g., timeout expired, invalid data received, peer disconnected, API returned error)
+2. **Error recovery**: What does the code do in response?
+   (e.g., retry with different peer, fallback to local, skip duty, enter stalled state)
+3. **Peer / resource penalty**: Does the client penalise a peer, ban it, or
+   reduce its score? Does it close a connection or discard a pool entry?
+4. **Fatal vs. recoverable**: Does the client crash/shutdown or retry?
+   (e.g., `panic`, `System.exit`, graceful retry loop)
+
+For each error-path transition, set `transition_type = "error"` in the output.
+
+**Examples of what to look for in code** (do not invent — only extract from snippets):
+- `catch/except/match Err(...)` blocks that branch into a different state
+- Functions returning early with an error (`return nil, err` / `bail!` / `throw`)
+- `log.Error(...)` followed by state-change logic
+- `downscorePeer`, `reportPeer`, `BanPeer`, `PeerAction::Fatal` calls
+- Timeout handlers (`time.After`, `.timeout()`, `Duration::from_secs`)
+- Circuit-breaker or fallback logic (`fallbackToLocal`, `circuitBreakerTripped`)
+
+### 🔲 BOUNDARY CONDITION EXTRACTION (required, not optional)
+
+**Boundary conditions are protocol-defined thresholds that change behaviour.**
+These are often the most security-relevant transitions because clients frequently
+diverge here. Look for:
+
+1. **Epoch boundaries**: Code gated on `slot % SLOTS_PER_EPOCH == 0`,
+   `compute_epoch_at_slot`, `process_epoch`, committee/shuffling cache rollover.
+2. **Fork/hardfork activation**: Code that checks which fork is active and
+   behaves differently post-fork (`IsAltairActive`, `IsDenebActive`,
+   `compute_fork_version`, milestone/epoch comparisons).
+3. **Timing windows**: The 1/3-slot proposer boost window, 2/3-slot aggregation
+   window, `ATTESTATION_PROPAGATION_SLOT_RANGE` (5 slots), slot deadlines.
+4. **Capacity / rate limits**: Queue size caps, orphan pool limits, optimistic
+   chain depth limit, max empty slots, peer count thresholds.
+5. **Protocol-defined cutoffs**: Weak subjectivity period, blob data availability
+   window (4096 epochs), sync committee rotation (256 epochs),
+   `MIN_VALIDATOR_WITHDRAWABILITY_DELAY`.
+
+For each boundary-condition transition, set `transition_type = "boundary"` in the output.
+
+**Examples to look for in code** (only from snippets):
+- `if (slot + 1) % SLOTS_PER_EPOCH == 0` / `is_epoch_start`
+- `if spec.altairForkEpoch <= epoch` / `if fork >= ForkName.deneb`
+- `if arrival_time < slot_start + SECONDS_PER_SLOT / 3`
+- `if orphan_count >= MAX_ORPHAN_POOL_SIZE` / `if depth >= MAX_OPTIMISTIC_DEPTH`
+- `if epoch < checkpoint.epoch + ws_period`
+- Constants like `SLOTS_PER_EPOCH`, `EPOCHS_PER_SYNC_COMMITTEE_PERIOD`,
+  `MIN_ATTESTATION_INCLUSION_DELAY` appearing in conditional logic
+
+Set `transition_type = "normal"` for all standard happy-path transitions.
+
+### 🔍 CONSENSUS VULNERABILITY ANALYSIS
+
+In addition to the normal state machine, you MAY report **consensus-impacting
+vulnerabilities** you find in {{ client_name }}'s {{ workflow_id }}
+implementation — bugs or weaknesses in THIS client that could cause consensus
+failures, chain splits, or safety violations regardless of other clients.
+
+**This is strictly evidence-gated. Do NOT go looking for trouble:**
+- Only report a vulnerability when the **actual code you have read** clearly
+  shows the defect. It is correct and expected to report ZERO vulnerabilities
+  for a workflow when the code does not show one.
+- Defensive code (nil checks, bounds checks, validation guards) and
+  stricter-than-spec checks are NOT vulnerabilities — do not report them.
+- A normal container insert, an ordinary RPC wrapper, or an API routing
+  function is NOT evidence of OOM / race / bypass. Do not extrapolate.
+- For every reported vulnerability you MUST be able to state a concrete
+  trigger chain: **attacker-controlled input → specific code path
+  (file:function:line) → consensus impact**. If you cannot identify a
+  remotely-reachable, attacker-controlled trigger, do NOT report it as a
+  CRITICAL consensus vulnerability.
+
+Use the categories below only as **investigative questions** to guide your
+reading of the source — not as a checklist to fill in:
+
+1. **Missing or Insufficient Validation**
+   - Is signature verification (BLS) skipped or deferred in any code path?
+   - Are state transition checks (slot, epoch, proposer index) complete?
+   - Can malformed or oversized messages bypass validation and crash the node?
+   - Are there integer overflow/underflow risks in slot/epoch arithmetic?
+
+2. **Race Conditions & Concurrency Bugs**
+   - Can concurrent block imports produce inconsistent fork-choice state?
+   - Are shared data structures (fork-choice store, attestation pool, peer DB)
+     protected against data races?
+   - Can two goroutines/tasks process the same block simultaneously?
+   - Is there a TOCTOU (time-of-check-time-of-use) gap between validation and import?
+
+3. **Denial-of-Service (DoS) Vectors**
+   - Can an attacker trigger unbounded memory allocation (e.g., large attestation lists,
+     unlimited pending blocks, unbounded orphan queues)?
+   - Are there CPU-intensive operations (BLS verification, state transition) that can be
+     triggered cheaply by an attacker?
+   - Can a malicious peer cause the node to enter an infinite retry loop?
+   - Is there proper rate limiting on gossip message processing?
+
+4. **Fork-Choice & Finality Safety**
+   - Can a crafted sequence of blocks cause the fork-choice to select an invalid chain?
+   - Is proposer boost correctly time-bounded (only within the first 4 seconds)?
+   - Can an attacker delay attestation delivery to manipulate fork-choice weights?
+   - Are equivocating (double) blocks/attestations correctly detected and handled?
+   - Can an unrealized justified/finalized checkpoint cause incorrect pruning?
+
+5. **Execution Layer (Engine API) Safety**
+   - Can a malicious or buggy EL cause the CL to accept an INVALID block?
+   - Is `INVALID` → `latestValidHash` cascade implemented correctly? Could a wrong
+     `latestValidHash` cause valid blocks to be incorrectly invalidated?
+   - Can a `SYNCING` status be exploited to keep the node permanently optimistic?
+   - Is there a timeout for Engine API calls? Can a stalled EL freeze CL processing?
+
+6. **Cryptographic & Slashing Safety**
+   - Is the slashing protection database always checked BEFORE signing?
+   - Can a crash between signing and recording to the slashing DB cause a double vote/proposal?
+   - Are BLS aggregation operations (aggregate verify, fast aggregate verify) used correctly?
+   - Is the domain separation (compute_domain) correct for all signature types?
+
+7. **State Corruption & Persistence**
+   - Can a crash during state write leave the database in an inconsistent state?
+   - Is the hot/cold state split correct — can archival states be incorrectly pruned?
+   - Can a checkpoint state be loaded from a corrupted or truncated DB entry?
+   - Are justified/finalized checkpoints persisted atomically with the blocks they reference?
+
+**How to Model a Vulnerability in the LSG (only when code-backed):**
+- Add an **error/vulnerability state** with prefix `<workflow>.vuln_*`
+  (e.g., `initial.vuln_race_import`), and prefix the state `label` with `[VULN]`.
+- Name the guard/action after the **actual symbols in the code**, not from any
+  example list. Do not invent generic names like `TriggerOOM` unless the code
+  literally supports that behavior.
+- The transition's `evidence` (file, function, line range) is **mandatory** and
+  must point at the exact code where the defect exists. A vulnerability state
+  without precise evidence must NOT be emitted.
+
+{% if code_snippets %}
+## Source Code Snippets (retrieved from {{ client_name }}, {{ code_snippets | length }} snippets)
+
+These snippets were retrieved locally from {{ client_name }}'s real source code.
+Each has a stable **evidence id**. You MUST derive your state machine from these
+snippets — not from spec descriptions, not from training memory.
+
+**Evidence rules (hard constraints):**
+1. Every transition MUST set `evidence.file` to a **file shown in one of the
+   snippets below**. The full set of valid files is:
+{% for snippet in code_snippets %}   - `{{ snippet.file }}`
+{% endfor %}
+2. `evidence.function` MUST be the **actual function name** shown in that snippet.
+3. `evidence.lines` MUST be within the line range of the chosen snippet
+   (shown as `L<start>–<end>` on each snippet header), or any sub-range you observe inside it.
+4. If a transition is not visible in any snippet, **leave evidence null** — do
+   NOT invent a plausible-looking path. A null evidence is honest; a hallucinated
+   path destroys the value of the whole LSG.
+5. Do NOT cite files that are NOT in the list above, even if you know they exist.
+
+{% for snippet in code_snippets %}
+### [{{ snippet.id }}] `{{ snippet.file }}` :: `{{ snippet.function }}` L{{ snippet.start_line }}–{{ snippet.end_line }}
+```{{ language }}
+{{ snippet.code }}
+```
+
+{% endfor %}
+{% else %}
+_No code snippets retrieved for this client/workflow. Build the state machine
+from the vocabulary above and prior iteration output if available. Set all
+evidence fields to null — do NOT invent file paths._
+{% endif %}
+
+{% if a_class_feedback %}
+## A-Class Vocabulary Alignment Feedback
+
+The following renames were identified in the previous iteration. Apply them precisely
+to align your output with the unified vocabulary. Do NOT restructure the state machine —
+only rename the specified guards/actions to their canonical equivalents.
+
+{% for fb in a_class_feedback %}
+- **{{ fb.workflow_id }}** → state `{{ fb.state_id }}`, guard `{{ fb.transition_guard }}`:
+  {{ fb.description }}
+  {% if fb.involved_clients and client_name in fb.involved_clients %}⚠️ **This applies to {{ client_name }}** — apply this rename in your output.{% endif %}
+{% endfor %}
+{% endif %}
+
+Output the complete LSG (with this ONE workflow) as structured YAML-compatible JSON.

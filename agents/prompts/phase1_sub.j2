@@ -1,0 +1,61 @@
+{# Phase 1 extraction prompt — grounded ONLY in retrieved snippets #}
+You are extracting Guard/Action vocabulary for the **{{ client_name }}**
+Ethereum consensus client ({{ language }}).
+
+A **Guard** is a branch predicate / precondition. An **Action** is a
+side-effect (state mutation, network send, signing, persistence, peer penalty).
+
+## Current Vocabulary (names only — do not re-emit these)
+
+Guards ({{ guard_names | length }}): {{ guard_names | join(', ') }}
+Actions ({{ action_names | length }}): {{ action_names | join(', ') }}
+
+## Retrieved Code Snippets
+
+Each snippet was retrieved locally from {{ client_name }}'s real source and
+carries an id plus its true file / function / line range. These snippets are
+the ONLY evidence you may use.
+
+{% for s in snippets %}
+### [{{ s.id }}] workflow={{ s.workflow_id }} — `{{ s.file }}` :: `{{ s.function }}` L{{ s.lines }}
+```{{ language }}
+{{ s.snippet }}
+```
+{% endfor %}
+
+## Task
+
+From the snippets above, identify **Guard conditions** and **Action
+side-effects** that are present in the code AND not already in the vocabulary.
+
+**Three types of entries to look for** (all are equally valuable):
+
+1. **Normal-path** entries — happy-path predicates and actions
+2. **Error-handling** entries — guards that detect failures, actions that
+   handle them (e.g. `IsBatchTimeout`, `IsInvalidPayload`, `BanPeer`,
+   `FallbackToLocal`, `CircuitBreakerTripped`)
+3. **Boundary-condition** entries — guards triggered at protocol thresholds
+   (e.g. `IsEpochBoundary`, `IsDenebActive`, `IsOneThirdSlot`,
+    `IsOptimisticDepthExceeded`, `IsWeakSubjectivityPeriodExpired`)
+
+For each entry provide:
+1. **name**: a concise PascalCase name
+2. **category**: one of (network, time, validation, validator, exec, mode,
+   block, peer, state, fork, committee, error, boundary)
+   Use `error` for failure-handling guards/actions; `boundary` for
+   threshold/transition-point guards/actions.
+3. **description**: one-sentence semantic description
+4. **evidence**: copy the **exact** `file`, `function` and `line` range from
+   the snippet the entry came from (fields: evidence_file, evidence_function,
+   evidence_lines).
+
+Hard rules:
+- Extract ONLY what the snippets actually show. Do NOT invent guards/actions or
+  cite any file that is not one of the snippets above.
+- Every entry MUST set `evidence_file` to a file shown above; entries without a
+  valid snippet file will be discarded.
+- It is correct to return few or zero entries when the snippets reveal nothing
+  new.
+
+Return your findings as a `VocabDiscoveryReport` with `new_guards` and
+`new_actions` lists (and `client_name` = "{{ client_name }}").

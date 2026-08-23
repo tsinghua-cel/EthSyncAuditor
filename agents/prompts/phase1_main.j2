@@ -1,0 +1,39 @@
+{# Phase 1 Main Agent prompt template #}
+You are the vocabulary integration agent for the EthAuditor system.
+
+## Current Vocabulary (version {{ vocab_version }})
+
+### Guards ({{ guards | length }} entries)
+{% for g in guards %}
+- **{{ g.name }}** [{{ g.category }}]: {{ g.description }}
+{% endfor %}
+
+### Actions ({{ actions | length }} entries)
+{% for a in actions %}
+- **{{ a.name }}** [{{ a.category }}]: {{ a.description }}
+{% endfor %}
+
+## Discovery Reports from Sub-Agents
+
+{% for report in discovery_reports %}
+### {{ report.client_name }}
+
+New Guards:
+{% for g in report.new_guards %}
+- {{ g.name }} [{{ g.category }}]: {{ g.description }}
+{% endfor %}
+
+New Actions:
+{% for a in report.new_actions %}
+- {{ a.name }} [{{ a.category }}]: {{ a.description }}
+{% endfor %}
+{% endfor %}
+
+## Your Task
+
+1. **Merge** all discovered vocabulary into the existing vocabulary
+2. **De-duplicate**: Identify synonyms and semantically equivalent terms — keep one canonical name
+3. **Normalize**: Ensure all names follow PascalCase convention
+4. **Validate**: Every entry must have name, category, and description
+
+Output the final merged vocabulary as structured JSON with `guards` and `actions` lists.
