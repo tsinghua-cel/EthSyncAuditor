@@ -28,6 +28,7 @@ Create a `.env` file:
 # Pick one
 ANTHROPIC_API_KEY=sk-ant-...
 GOOGLE_API_KEY=...
+GLM_API_KEY=...
 
 # Optional: custom base URL (proxy / private deployment)
 ANTHROPIC_BASE_URL=
@@ -41,8 +42,10 @@ The CLI flags `--anthropic-base-url` / `--gemini-base-url` override these.
 ```bash
 # use gemini
 python main.py --provider gemini
-# or anthropic.
+# or anthropic
 python main.py --provider anthropic
+# or glm.
+python main.py --provider glm
 
 # Resume from the latest checkpoint
 python main.py --resume
